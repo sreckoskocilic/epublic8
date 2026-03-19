@@ -1,0 +1,42 @@
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - errcheck
+    - staticcheck
+    - govet
+    - gosec
+    - contextcheck
+    - bodyclose
+    - revive
+    - unused
+    - nilerr
+    - exhaustruct
+
+linters-settings:
+  gosec:
+    excludes:
+      - G304 # file path from variable — acceptable in this service
+      - G204 # subprocess args are internally controlled
+      - G115 # int32 casts are intentional (proto field sizes)
+  revive:
+    rules:
+      - name: exported
+        severity: warning
+  exhaustruct:
+    exclude:
+      - ".*\\.pb\\.go"
+      - "google\\.golang\\.org/.*"
+      - "epublic8/pb\\..*"      # proto-generated types used in handlers
+      - "archive/zip\\.FileHeader" # stdlib with many optional fields
+      - "net/http\\.Server"     # stdlib with many optional fields
+
+issues:
+  exclude-dirs:
+    - pb
+  exclude-rules:
+    - path: "_test\\.go"
+      linters:
+        - exhaustruct
+        - gosec

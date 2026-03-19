@@ -1,0 +1,180 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: document-service-config
+  namespace: default
+data:
+  GRPC_PORT: "50051"
+  HTTP_PORT: "8080"
+  OUTPUT_DIR: "/output"
+  # 2 concurrent OCR goroutines: 2 tesseract processes × 1 OMP thread = 2 CPUs peak,
+  # leaving headroom for Go scheduler and pdftoppm within the 2000m CPU limit.
+  GOMAXPROCS: "2"
+  # Tesseract defaults to OMP_NUM_THREADS=num_cpus. With GOMAXPROCS=2 concurrent
+  # OCR goroutines each launching tesseract, 4 × 4 OMP threads = 16 CPU demand
+  # against a 4000m limit causes severe CFS throttling. Fix to 1 thread per process.
+  OMP_NUM_THREADS: "1"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: document-service
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: document-service
+  template:
+    metadata:
+      labels:
+        app: document-service
+    spec:
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: document-processor
+        image: document-service:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 50051
+          name: grpc
+        - containerPort: 8080
+          name: http
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        envFrom:
+        - configMapRef:
+            name: document-service-config
+        resources:
+          requests:
+            # One in-flight request: ~250 MB heap (2 decoded pages + runtime) +
+            # gRPC streaming buffers up to 200 MB document in heap. Two concurrent
+            # requests fit in 768 Mi; HPA scales before a third saturates the limit.
+            memory: "768Mi"
+            # GOMAXPROCS=2 + OMP_NUM_THREADS=1: 2 tesseract processes × 1 CPU +
+            # Go scheduler ≈ 2.5 CPUs steady state. 1000m request lets the scheduler
+            # bin-pack pods without guaranteeing idle cores.
+            cpu: "1000m"
+          limits:
+            # 2 Gi covers 3 concurrent max-size requests (3 × ~480 MB) with headroom.
+            # /tmp is now disk-backed so it no longer competes with this budget.
+            memory: "2Gi"
+            # 2000m matches GOMAXPROCS=2 OCR workers × 1 CPU each + Go scheduler.
+            # Previously 4000m with 4 tesseract × 4 OMP threads caused severe
+            # CFS throttling; 2000m is the actual ceiling for this concurrency level.
+            cpu: "2000m"
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 20
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          failureThreshold: 3
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: output
+          mountPath: /output
+      volumes:
+      - name: tmp
+        emptyDir:
+          # Do NOT use medium: Memory. On cgroupsv2 (all modern k8s nodes) tmpfs
+          # usage counts against the container memory cgroup. With medium: Memory
+          # and a 2Gi sizeLimit, the /tmp filesystem and the Go heap competed for
+          # the same 2Gi container limit, causing OOM kills under realistic load.
+          # A disk-backed emptyDir keeps temp file I/O off the memory budget entirely.
+          # Real peak /tmp usage per request: 200 MB upload + ~50 MB pdftoppm PNGs;
+          # 1Gi covers 4 concurrent requests with headroom.
+          sizeLimit: 1Gi
+      - name: output
+        emptyDir:
+          # EPUBs are cleaned up after 24 h by the in-process loop.
+          # 5 Gi covers burst accumulation if cleanup lags (200 MB max × ~25 files).
+          sizeLimit: 5Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: document-service
+  namespace: default
+spec:
+  selector:
+    app: document-service
+  ports:
+  - name: grpc
+    port: 50051
+    targetPort: 50051
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: document-service-lb
+  namespace: default
+spec:
+  selector:
+    app: document-service
+  ports:
+  - name: grpc
+    port: 50051
+    targetPort: 50051
+  - name: http
+    port: 8080
+    targetPort: 8080
+  type: LoadBalancer
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: document-service-hpa
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: document-service
+  minReplicas: 1
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        # 70% of 2000m = 1400m: triggers scale-out when a second OCR request
+        # arrives while one is already active, before the third would saturate.
+        # Previously 50% of 4000m = 2000m — that's the peak for 2 tesseract
+        # processes, so HPA would never trigger until fully saturated.
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        # 70% of 2Gi = 1.4Gi: triggers after roughly 3 concurrent requests.
+        # With /tmp now disk-backed, this threshold is meaningful — previously
+        # medium: Memory meant OOM hit before HPA could react.
+        type: Utilization
+        averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300

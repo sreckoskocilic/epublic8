@@ -1,0 +1,89 @@
+syntax = "proto3";
+
+package pb;
+
+option go_package = "epublic8/pb";
+
+service DocumentService {
+  rpc ProcessDocument(DocumentRequest) returns (DocumentResponse);
+  rpc StreamProcessDocument(stream DocumentChunk) returns (stream DocumentChunkResponse);
+  rpc ExtractEntities(EntityRequest) returns (EntityResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message DocumentRequest {
+  string document_id = 1;
+  bytes content = 2;
+  string mime_type = 3;
+  ProcessOptions options = 4;
+}
+
+message ProcessOptions {
+  bool enable_ocr = 1;
+  bool enable_summarization = 2;
+  bool enable_entity_extraction = 3;
+  string language = 4;
+}
+
+message DocumentResponse {
+  string document_id = 1;
+  string extracted_text = 2;
+  string summary = 3;
+  repeated Entity entities = 4;
+  DocumentMetadata metadata = 5;
+  ProcessingStats stats = 6;
+}
+
+message DocumentChunk {
+  string document_id = 1;
+  bytes content = 2;
+  int32 chunk_index = 3;
+  int32 total_chunks = 4;
+  ProcessOptions options = 5;
+}
+
+message DocumentChunkResponse {
+  string document_id = 1;
+  string extracted_text = 2;
+  int32 processed_chunks = 3;
+  bool is_final = 4;
+  ProcessingStats stats = 5;
+}
+
+message EntityRequest {
+  string document_id = 1;
+  string text = 2;
+  repeated string entity_types = 3;
+}
+
+message EntityResponse {
+  string document_id = 1;
+  repeated Entity entities = 2;
+}
+
+message Entity {
+  string text = 1;
+  string type = 2;
+  float confidence = 3;
+  string start_offset = 4;
+  string end_offset = 5;
+}
+
+message DocumentMetadata {
+  int32 page_count = 1;
+  string detected_language = 2;
+  string document_type = 3;
+}
+
+message ProcessingStats {
+  int64 processing_time_ms = 1;
+  int32 text_length = 2;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool healthy = 1;
+  string status = 2;
+  int32 active_requests = 3;
+}
