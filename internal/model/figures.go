@@ -2,6 +2,7 @@ package model
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"image"
@@ -37,7 +38,7 @@ type visionPageResult struct {
 
 // runVisionOCR runs the compiled vision_ocr binary on imgPath and returns the
 // structured result. Returns zero value (empty text, nil obs) on any failure.
-func runVisionOCR(imgPath, tesseractLang string) visionPageResult {
+func runVisionOCR(ctx context.Context, imgPath, tesseractLang string) visionPageResult {
 	visionOCROnce.Do(initVisionOCR)
 	if visionOCRBin == "" {
 		return visionPageResult{Text: "", Obs: nil}
@@ -47,7 +48,7 @@ func runVisionOCR(imgPath, tesseractLang string) visionPageResult {
 	if mapped, ok := tesseractLangToVision[first]; ok {
 		lang = mapped
 	}
-	out, err := exec.Command(visionOCRBin, "--image", imgPath, "--language", lang).Output()
+	out, err := exec.CommandContext(ctx, visionOCRBin, "--image", imgPath, "--language", lang).Output()
 	if err != nil {
 		return visionPageResult{Text: "", Obs: nil}
 	}

@@ -5,35 +5,92 @@ import (
 	"context"
 	"io"
 	"log"
+	"regexp"
+	"strconv"
 	"sync/atomic"
 
 	"epublic8/internal/model"
+	"epublic8/internal/tracing"
 	"epublic8/pb"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
+// Pre-compiled entity extraction patterns, keyed by entity type.
+var entityPatterns = map[string][]*regexp.Regexp{
+	"PERSON": {
+		// First Last name pattern (capitalized words)
+		regexp.MustCompile(`\b[A-Z][a-z]+ [A-Z][a-z]+\b`),
+		// Titles + Name (Mr., Mrs., Dr., etc.)
+		regexp.MustCompile(`\b(?:Mr\.|Mrs\.|Ms\.|Dr\.|Prof\.)\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\b`),
+	},
+	"LOCATION": {
+		// City, State patterns
+		regexp.MustCompile(`\b[A-Z][a-z]+,?\s+[A-Z]{2}\b`),
+		// Common location suffixes
+		regexp.MustCompile(`\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\s+(?:Street|St\.|Avenue|Ave\.|Road|Rd\.|Boulevard|Blvd\.|Drive|Dr\.|Lane|Ln\.|Way|Court|Ct\.|Place|Pl\.)\b`),
+		// Country names
+		regexp.MustCompile(`\b(?:United States|United Kingdom|Canada|Australia|Germany|France|Japan|China|India|Brazil|Mexico|Spain|Italy|Russia|Korea)\b`),
+	},
+	"ORGANIZATION": {
+		// Common company suffixes (optional periods)
+		regexp.MustCompile(`\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*\s+(?:Inc\.?|Corp\.?|LLC|Ltd\.?|Co\.?|Company|Corporation|Group|International|Technologies|Solutions|Services|Labs?)\b`),
+		// Acronyms followed by common words
+		regexp.MustCompile(`\b[A-Z]{2,}\s+(?:University|College|Institute|Foundation|Association|Organization)\b`),
+	},
+	"DATE": {
+		// Various date formats
+		regexp.MustCompile(`\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}[/-]\d{1,2}[/-]\d{1,2})\b`),
+		// Month Day, Year
+		regexp.MustCompile(`\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}\b`),
+		// Day Month Year
+		regexp.MustCompile(`\b\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}\b`),
+	},
+	"EMAIL": {
+		regexp.MustCompile(`\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b`),
+	},
+	"PHONE": {
+		// US phone format
+		regexp.MustCompile(`\b(?:\+1[-.\s]?)?\(?[0-9]{3}\)?[-.\s]?[0-9]{3}[-.\s]?[0-9]{4}\b`),
+	},
+}
+
 type DocumentHandler struct {
 	Processor      *model.DocumentProcessor
-	activeRequests int32
+	activeRequests atomic.Int32
 	pb.UnimplementedDocumentServiceServer
 }
 
-func NewDocumentHandler() *DocumentHandler {
+// NewDocumentHandler creates a new DocumentHandler with the given OCR settings.
+// If ocrConcurrencyLimit is <= 0, the default (GOMAXPROCS) will be used.
+// If ocrLanguages is empty, the default languages ["srp_latn+hrv", "srp_latn", "eng"] will be used.
+func NewDocumentHandler(ocrConcurrencyLimit int, ocrLanguages []string) *DocumentHandler {
 	return &DocumentHandler{
-		Processor:                          model.NewDocumentProcessor(),
-		activeRequests:                     0,
+		Processor:                          model.NewDocumentProcessor(ocrConcurrencyLimit, ocrLanguages),
+		activeRequests:                     atomic.Int32{},
 		UnimplementedDocumentServiceServer: pb.UnimplementedDocumentServiceServer{},
 	}
 }
 
 func (h *DocumentHandler) ProcessDocument(ctx context.Context, req *pb.DocumentRequest) (*pb.DocumentResponse, error) {
+	ctx, span := tracing.StartSpan(ctx, "ProcessDocument",
+		trace.WithAttributes(
+			attribute.String("document.id", req.DocumentId),
+			attribute.String("document.mime_type", req.MimeType),
+		),
+	)
+	defer span.End()
+
 	h.incrementRequests()
 	defer h.decrementRequests()
 
-	result, err := h.Processor.ProcessDocument(req.Content, req.MimeType, log.Printf)
+	result, err := h.Processor.ProcessDocument(ctx, req.Content, req.MimeType, log.Printf)
 	if err != nil {
+		tracing.AddSpanError(ctx, err)
 		return nil, status.Errorf(codes.Internal, "failed to process document: %v", err)
 	}
 	return &pb.DocumentResponse{
@@ -52,6 +109,9 @@ func (h *DocumentHandler) ProcessDocument(ctx context.Context, req *pb.DocumentR
 }
 
 func (h *DocumentHandler) StreamProcessDocument(stream pb.DocumentService_StreamProcessDocumentServer) error {
+	ctx, span := tracing.StartSpan(stream.Context(), "StreamProcessDocument")
+	defer span.End()
+
 	h.incrementRequests()
 	defer h.decrementRequests()
 
@@ -66,6 +126,7 @@ func (h *DocumentHandler) StreamProcessDocument(stream pb.DocumentService_Stream
 			break
 		}
 		if err != nil {
+			tracing.AddSpanError(ctx, err)
 			return status.Errorf(codes.Internal, "failed to receive chunk: %v", err)
 		}
 
@@ -78,9 +139,15 @@ func (h *DocumentHandler) StreamProcessDocument(stream pb.DocumentService_Stream
 	if chunksReceived == 0 {
 		return status.Error(codes.InvalidArgument, "stream contained no chunks")
 	}
+	if totalChunks > 0 && int32(chunksReceived) != totalChunks {
+		return status.Errorf(codes.DataLoss, "stream truncated: received %d of %d declared chunks", chunksReceived, totalChunks)
+	}
 
-	result, err := h.Processor.ProcessDocument(buf.Bytes(), "application/octet-stream", log.Printf)
+	span.SetAttributes(attribute.Int("stream.chunks_received", chunksReceived))
+
+	result, err := h.Processor.ProcessDocument(ctx, buf.Bytes(), "application/octet-stream", log.Printf)
 	if err != nil {
+		tracing.AddSpanError(ctx, err)
 		return status.Errorf(codes.Internal, "failed to process document: %v", err)
 	}
 
@@ -95,16 +162,89 @@ func (h *DocumentHandler) StreamProcessDocument(stream pb.DocumentService_Stream
 	})
 }
 
-func (h *DocumentHandler) ExtractEntities(ctx context.Context, req *pb.EntityRequest) (*pb.EntityResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "ExtractEntities has been removed")
-}
-
 func (h *DocumentHandler) Health(ctx context.Context, req *pb.HealthRequest) (*pb.HealthResponse, error) {
 	return &pb.HealthResponse{
 		Healthy:        h.Processor.IsLoaded(),
 		Status:         "ready",
-		ActiveRequests: atomic.LoadInt32(&h.activeRequests),
+		ActiveRequests: h.activeRequests.Load(),
 	}, nil
+}
+
+// ExtractEntities extracts named entities from the provided text.
+// It uses regex-based pattern matching to identify common entity types:
+// PERSON (names), LOCATION (places), ORGANIZATION (companies), DATE (dates),
+// EMAIL (email addresses), and PHONE (phone numbers).
+func (h *DocumentHandler) ExtractEntities(ctx context.Context, req *pb.EntityRequest) (*pb.EntityResponse, error) {
+	_, span := tracing.StartSpan(ctx, "ExtractEntities",
+		trace.WithAttributes(
+			attribute.String("document.id", req.DocumentId),
+		),
+	)
+	defer span.End()
+
+	if req.Text == "" {
+		return &pb.EntityResponse{
+			DocumentId: req.DocumentId,
+			Entities:   []*pb.Entity{},
+		}, nil
+	}
+
+	// Determine which entity types to extract
+	// If none specified, extract all supported types
+	typesToExtract := req.EntityTypes
+	if len(typesToExtract) == 0 {
+		typesToExtract = []string{"PERSON", "LOCATION", "ORGANIZATION", "DATE", "EMAIL", "PHONE"}
+	}
+
+	var entities []*pb.Entity
+
+	// Extract each requested entity type
+	for _, entityType := range typesToExtract {
+		patterns := getEntityPatterns(entityType)
+		for _, pattern := range patterns {
+			matches := pattern.FindAllStringIndex(req.Text, -1)
+			for _, match := range matches {
+				entities = append(entities, &pb.Entity{
+					Text:        req.Text[match[0]:match[1]],
+					Type:        entityType,
+					Confidence:  0.8, // Regex-based extraction has moderate confidence
+					StartOffset: strconv.Itoa(match[0]),
+					EndOffset:   strconv.Itoa(match[1]),
+				})
+			}
+		}
+	}
+
+	// Remove duplicates based on text and type
+	entities = deduplicateEntities(entities)
+
+	span.SetAttributes(attribute.Int("entities.count", len(entities)))
+
+	return &pb.EntityResponse{
+		DocumentId: req.DocumentId,
+		Entities:   entities,
+	}, nil
+}
+
+// getEntityPatterns returns pre-compiled regex patterns for the specified entity type.
+func getEntityPatterns(entityType string) []*regexp.Regexp {
+	return entityPatterns[entityType]
+}
+
+// deduplicateEntities removes duplicate entities based on text and type.
+func deduplicateEntities(entities []*pb.Entity) []*pb.Entity {
+	seen := make(map[string]bool)
+	var result []*pb.Entity
+
+	for _, e := range entities {
+		key := e.Type + ":" + e.Text
+		if !seen[key] {
+			seen[key] = true
+			result = append(result, e)
+		}
+	}
+
+	return result
 }
 
 func (h *DocumentHandler) Register(grpcServer *grpc.Server) {
@@ -112,11 +252,11 @@ func (h *DocumentHandler) Register(grpcServer *grpc.Server) {
 }
 
 func (h *DocumentHandler) incrementRequests() {
-	atomic.AddInt32(&h.activeRequests, 1)
+	h.activeRequests.Add(1)
 }
 
 func (h *DocumentHandler) decrementRequests() {
-	atomic.AddInt32(&h.activeRequests, -1)
+	h.activeRequests.Add(-1)
 }
 
 func (h *DocumentHandler) Close() error {

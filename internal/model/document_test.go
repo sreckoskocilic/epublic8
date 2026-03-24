@@ -1,17 +1,18 @@
 package model
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
 )
 
 func newProcessor() *DocumentProcessor {
-	return NewDocumentProcessor()
+	return NewDocumentProcessor(0, nil)
 }
 
 func newGenerator() *EPUBGenerator {
-	return NewEPUBGenerator()
+	return NewEPUBGenerator(0)
 }
 
 // --- hasGarbledCEEncoding ---
@@ -427,8 +428,8 @@ func TestGenerateFromTextEmpty(t *testing.T) {
 // --- NewDocumentProcessor / ProcessDocument ---
 
 func TestNewDocumentProcessorAndProcess(t *testing.T) {
-	p := NewDocumentProcessor()
-	result, err := p.ProcessDocument([]byte("Hello world"), "text/plain", func(string, ...any) {})
+	p := NewDocumentProcessor(0, nil)
+	result, err := p.ProcessDocument(context.Background(), []byte("Hello world"), "text/plain", func(string, ...any) {})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -455,4 +456,312 @@ func TestSplitIntoChaptersFallsBackToWordCount(t *testing.T) {
 	if len(chapters) < 2 {
 		t.Errorf("expected word-count fallback to produce multiple chapters, got %d", len(chapters))
 	}
+}
+
+// --- Additional edge case tests ---
+
+func TestProcessOptionsDefault(t *testing.T) {
+	opts := DefaultProcessOptions()
+	if !opts.SmartOCR {
+		t.Error("expected SmartOCR=true")
+	}
+	if !opts.StripHeaders {
+		t.Error("expected StripHeaders=true")
+	}
+	if !opts.StripFootnotes {
+		t.Error("expected StripFootnotes=true")
+	}
+	if opts.ForceOCR {
+		t.Error("expected ForceOCR=false")
+	}
+	if opts.TextOnly {
+		t.Error("expected TextOnly=false")
+	}
+}
+
+func TestProcessOptionsZeroValue(t *testing.T) {
+	opts := ProcessOptions{}
+	if opts.SmartOCR {
+		t.Error("expected SmartOCR=false for zero value")
+	}
+	if opts.StripHeaders {
+		t.Error("expected StripHeaders=false for zero value")
+	}
+	if opts.StripFootnotes {
+		t.Error("expected StripFootnotes=false for zero value")
+	}
+}
+
+func TestProcessOptionsWithAllOptions(t *testing.T) {
+	opts := ProcessOptions{
+		SmartOCR:       true,
+		ForceOCR:       true,
+		StripHeaders:   false,
+		StripFootnotes: false,
+		TextOnly:       true,
+	}
+
+	if !opts.SmartOCR {
+		t.Error("expected SmartOCR=true")
+	}
+	if !opts.ForceOCR {
+		t.Error("expected ForceOCR=true")
+	}
+	if opts.StripHeaders {
+		t.Error("expected StripHeaders=false")
+	}
+	if opts.StripFootnotes {
+		t.Error("expected StripFootnotes=false")
+	}
+	if !opts.TextOnly {
+		t.Error("expected TextOnly=true")
+	}
+}
+
+func TestEPUBResultStruct(t *testing.T) {
+	result := &EPUBResult{
+		Title:    "Test Book",
+		Author:   "Test Author",
+		Language: "en",
+		Chapters: []EPUBChapter{
+			{Title: "Chapter 1", Content: "Content 1", Images: nil},
+			{Title: "Chapter 2", Content: "Content 2", Images: nil},
+		},
+	}
+
+	if result.Title != "Test Book" {
+		t.Errorf("expected Title 'Test Book', got %q", result.Title)
+	}
+	if result.Author != "Test Author" {
+		t.Errorf("expected Author 'Test Author', got %q", result.Author)
+	}
+	if result.Language != "en" {
+		t.Errorf("expected Language 'en', got %q", result.Language)
+	}
+	if len(result.Chapters) != 2 {
+		t.Errorf("expected 2 chapters, got %d", len(result.Chapters))
+	}
+}
+
+func TestEPUBChapterStruct(t *testing.T) {
+	chapter := EPUBChapter{
+		Title:   "Test Chapter",
+		Content: "Test content",
+		Images: []PDFImage{
+			{Name: "img1.png", Data: []byte("data"), MimeType: "image/png", PageNum: 1, FigNum: 1, Caption: "Figure 1", WidthFraction: 0.5},
+		},
+	}
+
+	if chapter.Title != "Test Chapter" {
+		t.Errorf("expected Title 'Test Chapter', got %q", chapter.Title)
+	}
+	if chapter.Content != "Test content" {
+		t.Errorf("expected Content 'Test content', got %q", chapter.Content)
+	}
+	if len(chapter.Images) != 1 {
+		t.Errorf("expected 1 image, got %d", len(chapter.Images))
+	}
+}
+
+func TestPDFImageStruct(t *testing.T) {
+	img := PDFImage{
+		Name:          "test.png",
+		Data:          []byte("image data"),
+		MimeType:      "image/png",
+		PageNum:       5,
+		FigNum:        2,
+		Caption:       "Test figure",
+		WidthFraction: 0.75,
+	}
+
+	if img.Name != "test.png" {
+		t.Errorf("expected Name 'test.png', got %q", img.Name)
+	}
+	if img.PageNum != 5 {
+		t.Errorf("expected PageNum 5, got %d", img.PageNum)
+	}
+	if img.FigNum != 2 {
+		t.Errorf("expected FigNum 2, got %d", img.FigNum)
+	}
+	if img.WidthFraction != 0.75 {
+		t.Errorf("expected WidthFraction 0.75, got %f", img.WidthFraction)
+	}
+}
+
+func TestProcessResultStruct(t *testing.T) {
+	result := &ProcessResult{
+		ExtractedText: "Extracted text content",
+		PageCount:     10,
+		ProcessingMs:  500,
+		Images: []PDFImage{
+			{Name: "fig1.png", Data: nil, MimeType: "image/png", PageNum: 3, FigNum: 1, Caption: "", WidthFraction: 0},
+		},
+	}
+
+	if result.ExtractedText != "Extracted text content" {
+		t.Errorf("expected ExtractedText, got %q", result.ExtractedText)
+	}
+	if result.PageCount != 10 {
+		t.Errorf("expected PageCount 10, got %d", result.PageCount)
+	}
+	if result.ProcessingMs != 500 {
+		t.Errorf("expected ProcessingMs 500, got %d", result.ProcessingMs)
+	}
+	if len(result.Images) != 1 {
+		t.Errorf("expected 1 image, got %d", len(result.Images))
+	}
+}
+
+func TestSplitOnHeadingsWithMixedContent(t *testing.T) {
+	g := newGenerator()
+
+	// Mix of headings and regular text
+	text := "Some intro text.\nGlava 1\nChapter one content.\nSome text between.\nGlava 2\nChapter two content."
+	chapters := g.splitOnHeadings(text)
+
+	// Should find at least 2 chapters
+	if len(chapters) < 2 {
+		t.Errorf("expected at least 2 chapters, got %d", len(chapters))
+	}
+}
+
+func TestSplitOnHeadingsWithWhitespace(t *testing.T) {
+	g := newGenerator()
+
+	// Headings with whitespace
+	text := "   Glava 1   \nContent here.\n   Glava 2   \nMore content."
+	chapters := g.splitOnHeadings(text)
+
+	if len(chapters) < 2 {
+		t.Errorf("expected at least 2 chapters, got %d", len(chapters))
+	}
+}
+
+func TestSplitOnHeadingsRomanNumeralsMultiple(t *testing.T) {
+	g := newGenerator()
+
+	// Multiple roman numerals
+	text := "I.\nFirst.\nII.\nSecond.\nIII.\nThird.\nIV.\nFourth."
+	chapters := g.splitOnHeadings(text)
+
+	if len(chapters) < 4 {
+		t.Errorf("expected at least 4 chapters, got %d", len(chapters))
+	}
+}
+
+func TestSplitByWordCountExactlyAtBoundary(t *testing.T) {
+	g := newGenerator()
+
+	// Build text that's exactly around the chapter word boundary
+	words := make([]string, 1500) // Exactly at default boundary
+	for i := range words {
+		words[i] = "word"
+	}
+	text := strings.Join(words, " ")
+
+	chapters := g.splitByWordCount(text)
+
+	// With exactly 1500 words, should be 1 chapter
+	if len(chapters) != 1 {
+		t.Errorf("expected 1 chapter with exactly boundary words, got %d", len(chapters))
+	}
+}
+
+func TestSplitByWordCountOverBoundary(t *testing.T) {
+	g := newGenerator()
+
+	// Build text just over the chapter word boundary with paragraph separators.
+	// splitByWordCount splits on "\n\n" boundaries, so each paragraph must be
+	// separated by a double newline.
+	var paras []string
+	for i := 0; i < 16; i++ {
+		paras = append(paras, strings.Repeat("word ", 100))
+	}
+	text := strings.Join(paras, "\n\n") // 1600 words across 16 paragraphs
+
+	chapters := g.splitByWordCount(text)
+
+	// Should split into 2 chapters (1500 word boundary)
+	if len(chapters) < 2 {
+		t.Errorf("expected at least 2 chapters, got %d", len(chapters))
+	}
+}
+
+func TestSanitizeFilename(t *testing.T) {
+	// This is tested in web_test.go but we can add more edge cases here
+	// The sanitizeFilename function is in web.go, so we test it via the handler
+}
+
+func TestDedupEntities(t *testing.T) {
+	// Test deduplication logic via handler tests
+	// This is covered in handler_test.go
+}
+
+func TestAssignImagesToChaptersWithImagesOnChapterBoundaries(t *testing.T) {
+	// Images exactly on chapter boundaries
+	chapters := []EPUBChapter{
+		{Title: "Ch1", Content: "content1", Images: nil},
+		{Title: "Ch2", Content: "content2", Images: nil},
+	}
+	// Image on page 1 (Ch1), page 2 (between chapters), page 3 (Ch2)
+	images := []PDFImage{
+		{Name: "img1.png", Data: nil, MimeType: "image/png", PageNum: 1, FigNum: 0, Caption: "", WidthFraction: 0},
+		{Name: "img2.png", Data: nil, MimeType: "image/png", PageNum: 2, FigNum: 0, Caption: "", WidthFraction: 0},
+		{Name: "img3.png", Data: nil, MimeType: "image/png", PageNum: 3, FigNum: 0, Caption: "", WidthFraction: 0},
+	}
+	assignImagesToChapters(chapters, images, 4)
+
+	// Check distribution
+	total := 0
+	for _, ch := range chapters {
+		total += len(ch.Images)
+	}
+	if total != 3 {
+		t.Errorf("expected all 3 images assigned, got %d", total)
+	}
+}
+
+func TestAssignImagesToChaptersWithManyImages(t *testing.T) {
+	// Many images
+	chapters := []EPUBChapter{
+		{Title: "Ch1", Content: "content1", Images: nil},
+		{Title: "Ch2", Content: "content2", Images: nil},
+	}
+	images := make([]PDFImage, 100)
+	for i := range images {
+		images[i] = PDFImage{
+			Name:          "img.png",
+			Data:          nil,
+			MimeType:      "image/png",
+			PageNum:       i + 1,
+			FigNum:        0,
+			Caption:       "",
+			WidthFraction: 0,
+		}
+	}
+	assignImagesToChapters(chapters, images, 100)
+
+	// Should distribute roughly equally
+	total := 0
+	for _, ch := range chapters {
+		total += len(ch.Images)
+	}
+	if total != 100 {
+		t.Errorf("expected 100 images assigned, got %d", total)
+	}
+}
+
+func TestDocumentProcessorClose(t *testing.T) {
+	p := NewDocumentProcessor(0, nil)
+	// Close should not panic
+	err := p.Close()
+	if err != nil {
+		t.Errorf("unexpected error on close: %v", err)
+	}
+}
+
+func TestEPUBGeneratorClose(t *testing.T) {
+	g := NewEPUBGenerator(0)
+	// Close should not panic
+	g.Close()
 }

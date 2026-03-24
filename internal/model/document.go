@@ -1,8 +1,8 @@
 package model
 
 import (
+	"context"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,19 +13,17 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"epublic8/internal/errors"
+	"epublic8/internal/tracing"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
-// globalOCRSem bounds the total concurrent OCR page workers across all active
-// conversions. Defaults to GOMAXPROCS; override with OCR_CONCURRENCY env var.
-var globalOCRSem = make(chan struct{}, ocrConcurrency())
-
-func ocrConcurrency() int {
-	if s := os.Getenv("OCR_CONCURRENCY"); s != "" {
-		if n, err := strconv.Atoi(s); err == nil && n > 0 {
-			return n
-		}
-		log.Printf("warning: invalid value for OCR_CONCURRENCY, using GOMAXPROCS")
-	}
+// defaultOCRConcurrency returns the default OCR concurrency limit.
+// Defaults to GOMAXPROCS; override via NewDocumentProcessor.
+func defaultOCRConcurrency() int {
 	return max(1, runtime.GOMAXPROCS(0))
 }
 
@@ -87,7 +85,9 @@ func initVisionOCR() {
 
 	cmd := exec.Command(swiftc, "-O", src, "-o", binPath)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		_ = out // compilation errors are silently dropped
+		// Log compilation failure at DEBUG level - this is optional functionality
+		// and Tesseract is always available as a fallback.
+		errors.LogDebug("Vision OCR compilation failed: %s (using Tesseract fallback)", string(out))
 		os.Remove(binPath)
 		return
 	}
@@ -126,8 +126,8 @@ var tesseractLangToVision = map[string]string{
 // extractImageTextVision runs the Vision OCR binary on imgPath and returns
 // only the recognised text. Use runVisionOCR (in figures.go) when bounding
 // boxes are also needed (e.g., figure detection).
-func extractImageTextVision(imgPath, tesseractLang string) string {
-	return runVisionOCR(imgPath, tesseractLang).Text
+func extractImageTextVision(ctx context.Context, imgPath, tesseractLang string) string {
+	return runVisionOCR(ctx, imgPath, tesseractLang).Text
 }
 
 // footnoteMarkerRe matches lines that begin a footnote section. Three forms:
@@ -151,14 +151,23 @@ type ProcessOptions struct {
 func DefaultProcessOptions() ProcessOptions {
 	return ProcessOptions{
 		SmartOCR:       true,
-		ForceOCR:       false,
 		StripHeaders:   true,
 		StripFootnotes: true,
+		ForceOCR:       false,
 		TextOnly:       false,
 	}
 }
 
-type DocumentProcessor struct{}
+type DocumentProcessor struct {
+	// OCRConcurrencyLimit bounds the total concurrent OCR page workers across
+	// all active conversions. If zero, defaults to GOMAXPROCS.
+	OCRConcurrencyLimit int
+
+	// OCRLanguages is the ordered list of language codes for OCR (Vision and Tesseract).
+	// The first language in the list that is supported by the OCR system will be used.
+	// If empty, defaults to ["srp_latn+hrv", "srp_latn", "eng"].
+	OCRLanguages []string
+}
 
 // PDFImage holds a single image extracted from a PDF.
 type PDFImage struct {
@@ -174,9 +183,9 @@ type PDFImage struct {
 // extractPDFImages uses pdfimages to extract embedded images from pdfPath.
 // Returns nil when pdfimages is not available, on any error, or when all
 // images are smaller than 64×64 px (icons / bullets / noise).
-func extractPDFImages(pdfPath string, logf func(string, ...any)) []PDFImage {
+func extractPDFImages(ctx context.Context, pdfPath string, logf func(string, ...any)) []PDFImage {
 	// List images first to obtain page numbers and dimensions.
-	listOut, err := exec.Command("pdfimages", "-list", pdfPath).Output()
+	listOut, err := exec.CommandContext(ctx, "pdfimages", "-list", pdfPath).Output()
 	if err != nil {
 		return nil
 	}
@@ -212,7 +221,7 @@ func extractPDFImages(pdfPath string, logf func(string, ...any)) []PDFImage {
 	defer os.RemoveAll(tmpDir)
 
 	prefix := filepath.Join(tmpDir, "img")
-	if err := exec.Command("pdfimages", "-png", pdfPath, prefix).Run(); err != nil {
+	if err := exec.CommandContext(ctx, "pdfimages", "-png", pdfPath, prefix).Run(); err != nil {
 		return nil
 	}
 
@@ -284,29 +293,58 @@ type ProcessResult struct {
 	ProcessingMs  int64
 }
 
-func NewDocumentProcessor() *DocumentProcessor {
+// defaultOCRLanguages returns the default OCR languages if none specified.
+func defaultOCRLanguages() []string {
+	return []string{"srp_latn+hrv", "srp_latn", "eng"}
+}
+
+func NewDocumentProcessor(ocrConcurrencyLimit int, ocrLanguages []string) *DocumentProcessor {
 	// Compile the Vision OCR binary eagerly so the first real request doesn't
 	// pay a 2-10s swiftc compilation penalty.
 	go visionOCROnce.Do(initVisionOCR)
-	return &DocumentProcessor{}
+	limit := ocrConcurrencyLimit
+	if limit <= 0 {
+		limit = defaultOCRConcurrency()
+	}
+	languages := ocrLanguages
+	if len(languages) == 0 {
+		languages = defaultOCRLanguages()
+	}
+	return &DocumentProcessor{
+		OCRConcurrencyLimit: limit,
+		OCRLanguages:        languages,
+	}
 }
 
-func (p *DocumentProcessor) ProcessDocument(content []byte, mimeType string, logf func(string, ...any)) (*ProcessResult, error) {
+func (p *DocumentProcessor) ProcessDocument(ctx context.Context, content []byte, mimeType string, logf func(string, ...any)) (*ProcessResult, error) {
+	ctx, span := tracing.StartSpan(ctx, "ProcessDocument",
+		trace.WithAttributes(
+			attribute.String("document.mime_type", mimeType),
+			attribute.Int("document.size_bytes", len(content)),
+		),
+	)
+	defer span.End()
+
 	start := time.Now()
-	return &ProcessResult{
-		ExtractedText: p.extractText(content, mimeType, logf),
+	result := &ProcessResult{
+		ExtractedText: p.extractText(ctx, content, mimeType, logf),
 		PageCount:     1,
-		Images:        nil,
 		ProcessingMs:  time.Since(start).Milliseconds(),
-	}, nil
+		Images:        nil,
+	}
+	span.SetAttributes(
+		attribute.Int("result.text_length", len(result.ExtractedText)),
+		attribute.Int64("result.processing_ms", result.ProcessingMs),
+	)
+	return result, nil
 }
 
-func (p *DocumentProcessor) extractText(content []byte, mimeType string, logf func(string, ...any)) string {
+func (p *DocumentProcessor) extractText(ctx context.Context, content []byte, mimeType string, logf func(string, ...any)) string {
 	switch mimeType {
 	case "application/pdf":
-		return p.extractPDFText(content, logf)
+		return p.extractPDFText(ctx, content, logf)
 	case "image/png", "image/jpeg", "image/tiff":
-		return p.extractImageText(content, logf)
+		return p.extractImageText(ctx, content, logf)
 	case "text/plain", "text/markdown", "text/html", "application/octet-stream":
 		return string(content)
 	default:
@@ -315,116 +353,86 @@ func (p *DocumentProcessor) extractText(content []byte, mimeType string, logf fu
 	}
 }
 
-func (p *DocumentProcessor) extractPDFText(content []byte, logf func(string, ...any)) string {
-	tmpFile, err := os.CreateTemp("", "pdf_*.pdf")
+// writeTempFile writes content to a new temp file with the given name pattern
+// and returns its path. The caller must os.Remove the path when done.
+func writeTempFile(pattern string, content []byte, logf func(string, ...any)) (string, error) {
+	f, err := os.CreateTemp("", pattern)
+	if err != nil {
+		return "", err
+	}
+	path := f.Name()
+	if _, err := f.Write(content); err != nil {
+		if cerr := f.Close(); cerr != nil {
+			logf("warning: failed to close temp file after write error: %v", cerr)
+		}
+		os.Remove(path)
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		logf("warning: failed to close temp file: %v", err)
+	}
+	return path, nil
+}
+
+// runTesseractOCR tries each language in langs against imgPath using Tesseract.
+// Returns the first non-empty result and the language used, or ("", "") on failure.
+func runTesseractOCR(ctx context.Context, imgPath string, langs []string, logf func(string, ...any)) (text, usedLang string) {
+	ocrBase := imgPath + "_tess"
+	for _, lang := range langs {
+		if exec.CommandContext(ctx, "tesseract", imgPath, ocrBase, "-l", lang).Run() != nil {
+			continue
+		}
+		data, err := os.ReadFile(ocrBase + ".txt")
+		if rerr := os.Remove(ocrBase + ".txt"); rerr != nil && !os.IsNotExist(rerr) {
+			if logf != nil {
+				logf("warning: failed to remove OCR tmp file: %v", rerr)
+			}
+		}
+		if err != nil {
+			if logf != nil {
+				logf("warning: failed to read OCR output: %v", err)
+			}
+			continue
+		}
+		if strings.TrimSpace(string(data)) != "" {
+			return string(data), lang
+		}
+	}
+	return "", ""
+}
+
+func (p *DocumentProcessor) extractPDFText(ctx context.Context, content []byte, logf func(string, ...any)) string {
+	path, err := writeTempFile("pdf_*.pdf", content, logf)
 	if err != nil {
 		return fmt.Sprintf("[PDF Error: %v]", err)
 	}
-	defer os.Remove(tmpFile.Name())
-	if _, err := tmpFile.Write(content); err != nil {
-		if cerr := tmpFile.Close(); cerr != nil {
-			logf("warning: failed to close tmp pdf file after write error: %v", cerr)
-		}
-		return fmt.Sprintf("[PDF Error: %v]", err)
-	}
-	if err := tmpFile.Close(); err != nil {
-		logf("warning: failed to close tmp pdf file: %v", err)
-	}
-	text, _ := p.extractPDFTextFromPath(tmpFile.Name(), DefaultProcessOptions(), logf)
+	defer os.Remove(path)
+	text, _, _ := p.extractPDFTextFromPath(ctx, path, DefaultProcessOptions(), logf)
 	return text
 }
 
 // extractImageText OCRs a raw image (PNG/JPEG/TIFF) by writing it to a temp
 // file and running Vision OCR (macOS) or Tesseract as fallback.
-func (p *DocumentProcessor) extractImageText(content []byte, logf func(string, ...any)) string {
-	tmpFile, err := os.CreateTemp("", "img_ocr_*")
+func (p *DocumentProcessor) extractImageText(ctx context.Context, content []byte, logf func(string, ...any)) string {
+	path, err := writeTempFile("img_ocr_*", content, logf)
 	if err != nil {
 		return fmt.Sprintf("[Image OCR Error: %v]", err)
 	}
-	defer os.Remove(tmpFile.Name())
-	if _, err := tmpFile.Write(content); err != nil {
-		if cerr := tmpFile.Close(); cerr != nil {
-			logf("warning: failed to close tmp image file after write error: %v", cerr)
-		}
-		return fmt.Sprintf("[Image OCR Error: %v]", err)
-	}
-	if err := tmpFile.Close(); err != nil {
-		logf("warning: failed to close tmp image file: %v", err)
-	}
+	defer os.Remove(path)
 
-	langs := []string{"srp_latn+hrv", "srp_latn", "eng"}
-	for _, lang := range langs {
-		if t := extractImageTextVision(tmpFile.Name(), lang); t != "" {
+	for _, lang := range p.OCRLanguages {
+		if t := extractImageTextVision(ctx, path, lang); t != "" {
 			logf("Image OCR engine=vision:%s chars=%d", lang, len(t))
 			return t
 		}
 	}
 
 	// Tesseract fallback.
-	ocrBase := tmpFile.Name() + "_tess"
-	for _, lang := range langs {
-		c := exec.Command("tesseract", tmpFile.Name(), ocrBase, "-l", lang)
-		if c.Run() != nil {
-			continue
-		}
-		data, err := os.ReadFile(ocrBase + ".txt")
-		if rerr := os.Remove(ocrBase + ".txt"); rerr != nil && !os.IsNotExist(rerr) {
-			logf("warning: failed to remove OCR tmp file: %v", rerr)
-		}
-		if err != nil {
-			logf("warning: failed to read OCR output: %v", err)
-			continue
-		}
-		if strings.TrimSpace(string(data)) != "" {
-			logf("Image OCR engine=tesseract:%s chars=%d", lang, len(data))
-			return string(data)
-		}
+	if t, lang := runTesseractOCR(ctx, path, p.OCRLanguages, logf); t != "" {
+		logf("Image OCR engine=tesseract:%s chars=%d", lang, len(t))
+		return t
 	}
 	return "[Image OCR: no text recognised]"
-}
-
-// pdfHasUnmappedFonts runs pdffonts and returns true if any font uses Custom
-// encoding with no ToUnicode mapping. This is a reliable upfront indicator that
-// pdftotext will produce garbled output, allowing us to skip straight to OCR.
-func pdfHasUnmappedFonts(pdfPath string) bool {
-	out, err := exec.Command("pdffonts", pdfPath).Output()
-	if err != nil {
-		return false
-	}
-	lines := strings.Split(string(out), "\n")
-	// Need at least: header line, separator line, one data line.
-	if len(lines) < 3 {
-		return false
-	}
-	// Derive column start positions from the separator line (groups of dashes).
-	sep := lines[1]
-	var colStarts []int
-	inDash := false
-	for i, c := range sep {
-		if c == '-' && !inDash {
-			colStarts = append(colStarts, i)
-			inDash = true
-		} else if c != '-' {
-			inDash = false
-		}
-	}
-	// Columns: name(0) type(1) encoding(2) emb(3) sub(4) uni(5) object(6)
-	if len(colStarts) < 7 {
-		return false
-	}
-	encStart, encEnd := colStarts[2], colStarts[3]
-	uniStart := colStarts[5]
-	for _, line := range lines[2:] {
-		if len(line) <= uniStart {
-			continue
-		}
-		enc := strings.TrimSpace(line[encStart:min(encEnd, len(line))])
-		uni := strings.TrimSpace(line[uniStart:min(uniStart+3, len(line))])
-		if enc == "Custom" && uni == "no" {
-			return true
-		}
-	}
-	return false
 }
 
 // scanFontRe matches the auto-generated font-subset names that macOS Quartz and
@@ -432,20 +440,21 @@ func pdfHasUnmappedFonts(pdfPath string) bool {
 // Format: six uppercase letters + "+" + arbitrary suffix (e.g. "AAAAAB+Fd431742").
 var scanFontRe = regexp.MustCompile(`^[A-Z]{6}\+`)
 
-// pdfLikelyScan returns true when all named fonts in the PDF use the
-// auto-generated subset naming pattern produced by scan-to-PDF workflows.
-// These PDFs have ToUnicode maps (so pdftotext doesn't error out) but the
-// embedded text is the output of a prior OCR pass and may contain errors;
-// re-rendering the page images with our own OCR gives an independent result.
-func pdfLikelyScan(pdfPath string) bool {
-	out, err := exec.Command("pdffonts", pdfPath).Output()
+// parsePDFFonts runs pdffonts on pdfPath once and returns:
+//   - hasUnmapped: any font uses Custom encoding with no ToUnicode map (pdftotext will garble)
+//   - likelyScan:  all named fonts use auto-generated subset names (scan-to-PDF re-OCR candidate)
+func parsePDFFonts(ctx context.Context, pdfPath string) (hasUnmapped, likelyScan bool) {
+	out, err := exec.CommandContext(ctx, "pdffonts", pdfPath).Output()
 	if err != nil {
-		return false
+		return false, false
 	}
 	lines := strings.Split(string(out), "\n")
+	// Need at least: header line, separator line, one data line.
 	if len(lines) < 3 {
-		return false
+		return false, false
 	}
+	// Derive column start positions from the separator line (groups of dashes).
+	// Columns: name(0) type(1) encoding(2) emb(3) sub(4) uni(5) object(6)
 	sep := lines[1]
 	var colStarts []int
 	inDash := false
@@ -458,9 +467,14 @@ func pdfLikelyScan(pdfPath string) bool {
 		}
 	}
 	if len(colStarts) < 2 {
-		return false
+		return false, false
 	}
 	nameEnd := colStarts[1]
+	canCheckEnc := len(colStarts) >= 7
+	var encStart, encEnd, uniStart int
+	if canCheckEnc {
+		encStart, encEnd, uniStart = colStarts[2], colStarts[3], colStarts[5]
+	}
 	total, scan := 0, 0
 	for _, line := range lines[2:] {
 		if len(line) < nameEnd {
@@ -474,19 +488,29 @@ func pdfLikelyScan(pdfPath string) bool {
 		if scanFontRe.MatchString(name) {
 			scan++
 		}
+		if canCheckEnc && !hasUnmapped && len(line) > uniStart {
+			enc := strings.TrimSpace(line[encStart:min(encEnd, len(line))])
+			uni := strings.TrimSpace(line[uniStart:min(uniStart+3, len(line))])
+			if enc == "Custom" && uni == "no" {
+				hasUnmapped = true
+			}
+		}
 	}
-	return total > 0 && scan == total
+	likelyScan = total > 0 && scan == total
+	return hasUnmapped, likelyScan
 }
 
-// extractPDFTextFromPath returns the text and any embedded images from pdfPath.
-func (p *DocumentProcessor) extractPDFTextFromPath(pdfPath string, opts ProcessOptions, logf func(string, ...any)) (string, []PDFImage) {
-	runOCR := func() (string, []PDFImage) {
-		if ocr, figs := p.extractPDFTextOCR(pdfPath, logf); ocr != "" {
+// extractPDFTextFromPath returns the text, any embedded images, and the page
+// count from pdfPath. Page count is 0 on the pdftotext path (caller must call
+// pdfPageCount separately); it is set when OCR is used.
+func (p *DocumentProcessor) extractPDFTextFromPath(ctx context.Context, pdfPath string, opts ProcessOptions, logf func(string, ...any)) (string, []PDFImage, int) {
+	runOCR := func() (string, []PDFImage, int) {
+		if ocr, figs, n := p.extractPDFTextOCR(ctx, pdfPath, logf); ocr != "" {
 			logf("OCR complete (%d chars)", len(ocr))
-			return p.processFootnotes(ocr, opts), figs
+			return p.processFootnotes(ocr, opts), figs, n
 		}
 		logf("OCR produced no output")
-		return "", nil
+		return "", nil, 0
 	}
 
 	if opts.ForceOCR {
@@ -494,35 +518,37 @@ func (p *DocumentProcessor) extractPDFTextFromPath(pdfPath string, opts ProcessO
 		return runOCR()
 	}
 
-	if opts.SmartOCR && pdfHasUnmappedFonts(pdfPath) {
-		logf("Custom-encoded fonts detected, skipping pdftotext")
-		return runOCR()
-	}
-
-	if opts.SmartOCR && pdfLikelyScan(pdfPath) {
-		logf("Scan-based PDF detected (embedded OCR fonts), re-rendering pages for fresh OCR")
-		if text, figs := runOCR(); text != "" {
-			return text, figs
+	if opts.SmartOCR {
+		hasUnmapped, likelyScan := parsePDFFonts(ctx, pdfPath)
+		if hasUnmapped {
+			logf("Custom-encoded fonts detected, skipping pdftotext")
+			return runOCR()
 		}
-		logf("OCR produced no output, falling back to pdftotext")
+		if likelyScan {
+			logf("Scan-based PDF detected (embedded OCR fonts), re-rendering pages for fresh OCR")
+			if text, figs, n := runOCR(); text != "" {
+				return text, figs, n
+			}
+			logf("OCR produced no output, falling back to pdftotext")
+		}
 	}
 
 	outFile, err := os.CreateTemp("", "pdftext_*.txt")
 	if err != nil {
-		return fmt.Sprintf("[PDF Error: %v]", err), nil
+		return fmt.Sprintf("[PDF Error: %v]", err), nil, 0
 	}
 	outputFile := outFile.Name()
 	outFile.Close()
 	defer os.Remove(outputFile)
 
-	cmd := exec.Command("pdftotext", pdfPath, outputFile)
+	cmd := exec.CommandContext(ctx, "pdftotext", pdfPath, outputFile)
 	if err := cmd.Run(); err != nil {
-		return fmt.Sprintf("[PDF Error: %v]", err), nil
+		return fmt.Sprintf("[PDF Error: %v]", err), nil, 0
 	}
 
 	text, err := os.ReadFile(outputFile)
 	if err != nil {
-		return fmt.Sprintf("[PDF Error: %v]", err), nil
+		return fmt.Sprintf("[PDF Error: %v]", err), nil, 0
 	}
 
 	extracted := string(text)
@@ -533,33 +559,46 @@ func (p *DocumentProcessor) extractPDFTextFromPath(pdfPath string, opts ProcessO
 		} else {
 			logf("Garbled encoding detected, falling back to OCR")
 		}
-		if text, figs := runOCR(); text != "" {
-			return text, figs
+		if text, figs, n := runOCR(); text != "" {
+			return text, figs, n
 		}
 		logf("OCR produced no output, using pdftotext result")
-		return p.processFootnotes(extracted, opts), nil
+		return p.processFootnotes(extracted, opts), nil, 0
 	}
 
 	// Native-text PDF: extract embedded images unless text-only mode.
 	var images []PDFImage
 	if !opts.TextOnly {
-		images = extractPDFImages(pdfPath, logf)
+		images = extractPDFImages(ctx, pdfPath, logf)
 	}
-	return p.processFootnotes(extracted, opts), images
+	return p.processFootnotes(extracted, opts), images, 0
 }
 
 // ProcessDocumentFromPath processes a file already on disk.
 // For PDFs this avoids writing content to a second temp file.
 // smartOCR enables upfront font-encoding detection via pdffonts to skip
 // directly to OCR when Custom-encoded fonts are found.
-func (p *DocumentProcessor) ProcessDocumentFromPath(filePath, mimeType string, opts ProcessOptions, logf func(string, ...any)) (*ProcessResult, error) {
+func (p *DocumentProcessor) ProcessDocumentFromPath(ctx context.Context, filePath, mimeType string, opts ProcessOptions, logf func(string, ...any)) (*ProcessResult, error) {
+	ctx, span := tracing.StartSpan(ctx, "ProcessDocumentFromPath",
+		trace.WithAttributes(
+			attribute.String("document.mime_type", mimeType),
+			attribute.String("document.path", filePath),
+			attribute.Bool("ocr.smart", opts.SmartOCR),
+			attribute.Bool("ocr.force", opts.ForceOCR),
+		),
+	)
+	defer span.End()
+
 	start := time.Now()
 	var extractedText string
 	var images []PDFImage
 	pageCount := 1
 	if mimeType == "application/pdf" {
-		extractedText, images = p.extractPDFTextFromPath(filePath, opts, logf)
-		if n := pdfPageCount(filePath); n > 0 {
+		var ocrPageCount int
+		extractedText, images, ocrPageCount = p.extractPDFTextFromPath(ctx, filePath, opts, logf)
+		if ocrPageCount > 0 {
+			pageCount = ocrPageCount
+		} else if n := pdfPageCount(ctx, filePath); n > 0 {
 			pageCount = n
 		}
 	} else {
@@ -567,14 +606,21 @@ func (p *DocumentProcessor) ProcessDocumentFromPath(filePath, mimeType string, o
 		if err != nil {
 			return nil, fmt.Errorf("read file: %w", err)
 		}
-		extractedText = p.extractText(content, mimeType, logf)
+		extractedText = p.extractText(ctx, content, mimeType, logf)
 	}
-	return &ProcessResult{
+	result := &ProcessResult{
 		ExtractedText: extractedText,
 		PageCount:     pageCount,
 		Images:        images,
 		ProcessingMs:  time.Since(start).Milliseconds(),
-	}, nil
+	}
+	span.SetAttributes(
+		attribute.Int("result.page_count", pageCount),
+		attribute.Int("result.text_length", len(extractedText)),
+		attribute.Int("result.image_count", len(images)),
+		attribute.Int64("result.processing_ms", result.ProcessingMs),
+	)
+	return result, nil
 }
 
 // hasGarbledCEEncoding detects when a PDF font maps Central European characters
@@ -629,8 +675,8 @@ func (p *DocumentProcessor) hasGarbledCEEncoding(text string) bool {
 }
 
 // pdfPageCount returns the number of pages in the PDF using pdfinfo.
-func pdfPageCount(pdfPath string) int {
-	out, err := exec.Command("pdfinfo", pdfPath).Output()
+func pdfPageCount(ctx context.Context, pdfPath string) int {
+	out, err := exec.CommandContext(ctx, "pdfinfo", pdfPath).Output()
 	if err != nil {
 		return 0
 	}
@@ -647,18 +693,21 @@ func pdfPageCount(pdfPath string) int {
 
 // extractPDFTextOCR renders each PDF page to an image, runs OCR, and detects
 // figures via Vision observation bounding boxes.
-// Returns the full text and any cropped figure images.
-func (p *DocumentProcessor) extractPDFTextOCR(pdfPath string, logf func(string, ...any)) (string, []PDFImage) {
-	pageCount := pdfPageCount(pdfPath)
+// Returns the full text, any cropped figure images, and the page count.
+func (p *DocumentProcessor) extractPDFTextOCR(ctx context.Context, pdfPath string, logf func(string, ...any)) (string, []PDFImage, int) {
+	pageCount := pdfPageCount(ctx, pdfPath)
 	if pageCount == 0 {
-		return "", nil
+		return "", nil, 0
 	}
 
 	tmpDir, err := os.MkdirTemp("", "pdf_ocr_*")
 	if err != nil {
-		return "", nil
+		return "", nil, 0
 	}
 	defer os.RemoveAll(tmpDir)
+
+	// Create a semaphore for OCR concurrency limiting.
+	ocrSem := make(chan struct{}, p.OCRConcurrencyLimit)
 
 	type pageResult struct {
 		text string
@@ -671,25 +720,24 @@ func (p *DocumentProcessor) extractPDFTextOCR(pdfPath string, logf func(string, 
 		wg.Add(1)
 		go func(page int) {
 			defer wg.Done()
-			globalOCRSem <- struct{}{}
-			defer func() { <-globalOCRSem }()
+			ocrSem <- struct{}{}
+			defer func() { <-ocrSem }()
 
 			imgBase := fmt.Sprintf("%s/p%d", tmpDir, page)
-			cmd := exec.Command("pdftoppm", "-r", "300", "-png", "-f", strconv.Itoa(page+1), "-l", strconv.Itoa(page+1), "-singlefile", pdfPath, imgBase)
+			cmd := exec.CommandContext(ctx, "pdftoppm", "-r", "300", "-png", "-f", strconv.Itoa(page+1), "-l", strconv.Itoa(page+1), "-singlefile", pdfPath, imgBase)
 			if cmd.Run() != nil {
 				return
 			}
 			imgPath := imgBase + ".png"
 			defer os.Remove(imgPath)
 
-			langs := []string{"srp_latn+hrv", "srp_latn", "eng"}
 			usedLang := "none"
 			var pageText string
 			var pageFigs []PDFImage
 
 			// Try Vision first: returns text + bounding boxes for figure detection.
-			for _, lang := range langs {
-				vr := runVisionOCR(imgPath, lang)
+			for _, lang := range p.OCRLanguages {
+				vr := runVisionOCR(ctx, imgPath, lang)
 				if vr.Text == "" {
 					continue
 				}
@@ -706,19 +754,9 @@ func (p *DocumentProcessor) extractPDFTextOCR(pdfPath string, logf func(string, 
 
 			// Tesseract fallback (no figure detection).
 			if pageText == "" {
-				ocrBase := fmt.Sprintf("%s/p%d_ocr", tmpDir, page)
-				for _, lang := range langs {
-					c := exec.Command("tesseract", imgPath, ocrBase, "-l", lang)
-					if c.Run() != nil {
-						continue
-					}
-					data, err := os.ReadFile(ocrBase + ".txt")
-					os.Remove(ocrBase + ".txt")
-					if err == nil && strings.TrimSpace(string(data)) != "" {
-						usedLang = "tesseract:" + lang
-						pageText = string(data)
-						break
-					}
+				if t, lang := runTesseractOCR(ctx, imgPath, p.OCRLanguages, nil); t != "" {
+					usedLang = "tesseract:" + lang
+					pageText = t
 				}
 				logf("OCR page %d/%d engine=%s", page+1, pageCount, usedLang)
 			}
@@ -735,7 +773,7 @@ func (p *DocumentProcessor) extractPDFTextOCR(pdfPath string, logf func(string, 
 		allText.WriteString("\f") // page separator — enables processFootnotes per-page
 		allFigs = append(allFigs, r.figs...)
 	}
-	return allText.String(), allFigs
+	return allText.String(), allFigs, pageCount
 }
 
 func (p *DocumentProcessor) processFootnotes(text string, opts ProcessOptions) string {
@@ -903,7 +941,7 @@ func (p *DocumentProcessor) IsLoaded() bool {
 }
 
 type EPUBGenerator struct {
-	MaxWordsPerChapter int // configurable via EPUB_CHAPTER_WORDS env var
+	MaxWordsPerChapter int // maximum words per chapter; defaults to 1500
 }
 
 type EPUBChapter struct {
@@ -920,16 +958,13 @@ type EPUBResult struct {
 	ProcessingMs int64
 }
 
-func NewEPUBGenerator() *EPUBGenerator {
-	maxWords := 1500
-	if s := os.Getenv("EPUB_CHAPTER_WORDS"); s != "" {
-		if n, err := strconv.Atoi(s); err == nil && n > 0 {
-			maxWords = n
-		} else {
-			log.Printf("warning: invalid value for EPUB_CHAPTER_WORDS, using default %d", maxWords)
-		}
+// NewEPUBGenerator creates a new EPUBGenerator with the given max words per chapter.
+// If maxWordsPerChapter is <= 0, the default (1500) is used.
+func NewEPUBGenerator(maxWordsPerChapter int) *EPUBGenerator {
+	if maxWordsPerChapter <= 0 {
+		maxWordsPerChapter = 1500
 	}
-	return &EPUBGenerator{MaxWordsPerChapter: maxWords}
+	return &EPUBGenerator{MaxWordsPerChapter: maxWordsPerChapter}
 }
 
 // GenerateFromText splits text into chapters and distributes images across them
@@ -957,12 +992,12 @@ func (g *EPUBGenerator) GenerateFromText(text string, images []PDFImage, totalPa
 func assignImagesToChapters(chapters []EPUBChapter, images []PDFImage, totalPages int) {
 	n := len(chapters)
 	if totalPages <= 0 {
-		log.Printf("assignImagesToChapters: totalPages=%d, all %d images will be assigned to first chapter", totalPages, len(images))
+		errors.LogWarn("assignImagesToChapters: totalPages=%d, all %d images will be assigned to first chapter", totalPages, len(images))
 		totalPages = 1
 	}
 	for i, img := range images {
 		// Map page number (1-based) to chapter index (0-based).
-		idx := (img.PageNum - 1) * n / totalPages
+		idx := int((int64(img.PageNum) - 1) * int64(n) / int64(totalPages))
 		if idx < 0 {
 			idx = 0
 		} else if idx >= n {
@@ -1056,7 +1091,7 @@ func (g *EPUBGenerator) splitByWordCount(text string) []EPUBChapter {
 		wordCount += len(strings.Fields(para))
 		if wordCount >= maxWordsPerChapter {
 			chapters = append(chapters, EPUBChapter{
-				Title:   fmt.Sprintf("%d", chapterCount),
+				Title:   strconv.Itoa(chapterCount),
 				Content: strings.TrimSpace(current.String()),
 				Images:  nil,
 			})
@@ -1067,7 +1102,7 @@ func (g *EPUBGenerator) splitByWordCount(text string) []EPUBChapter {
 	}
 	if current.Len() > 0 {
 		chapters = append(chapters, EPUBChapter{
-			Title:   fmt.Sprintf("%d", chapterCount),
+			Title:   strconv.Itoa(chapterCount),
 			Content: strings.TrimSpace(current.String()),
 			Images:  nil,
 		})

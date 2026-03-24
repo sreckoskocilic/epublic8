@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"context"
 	crand "crypto/rand"
+	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -14,12 +15,28 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
+	"epublic8/internal/config"
+	"epublic8/internal/errors"
+	"epublic8/internal/handler/middleware"
 	"epublic8/internal/model"
-	"epublic8/pb"
+	"epublic8/internal/tracing"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+)
+
+// Build info variables set at build time via -ldflags.
+var (
+	Version   = "dev"
+	Commit    = "unknown"
+	BuildTime = "unknown"
 )
 
 type WebHandler struct {
@@ -28,578 +45,33 @@ type WebHandler struct {
 	uploadDir       string
 	persistentDir   bool
 	templates       *template.Template
-	pb.UnimplementedDocumentServiceServer
+	securityCfg     config.SecurityConfig
+	metricsCfg      config.MetricsConfig
 }
 
-var uploadPageHTML = `<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Document to EPUB Converter</title>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            display: flex;
-            align-items: flex-start;
-            justify-content: center;
-            padding: 40px 20px;
-        }
-        .page {
-            display: flex;
-            gap: 24px;
-            width: 100%;
-            max-width: 1100px;
-            align-items: flex-start;
-        }
-        .left {
-            display: flex;
-            flex-direction: column;
-            gap: 20px;
-            flex: 1;
-            min-width: 0;
-        }
-        .right {
-            width: 300px;
-            flex-shrink: 0;
-            display: flex;
-            flex-direction: column;
-            gap: 16px;
-        }
-        .card {
-            background: white;
-            border-radius: 16px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            padding: 28px;
-        }
-        h1 { color: #1a1a1a; margin-bottom: 4px; font-size: 22px; font-weight: 700; }
-        .subtitle { color: #888; margin-bottom: 20px; font-size: 13px; }
+//go:embed templates
+var templatesFS embed.FS
 
-        /* ── Drop zone (empty state) ── */
-        input[type="file"] { display: none; }
-        .drop-zone {
-            border: 1.5px dashed #d0d0d0;
-            border-radius: 10px;
-            padding: 18px 16px;
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            cursor: pointer;
-            transition: border-color 0.2s, background 0.2s;
-            margin-bottom: 14px;
-            position: relative;
-        }
-        .drop-zone:hover, .drop-zone.dragover {
-            border-color: #667eea;
-            background: #f6f7ff;
-        }
-        .drop-zone-icon {
-            width: 36px;
-            height: 36px;
-            border-radius: 8px;
-            background: #f0f0f0;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            flex-shrink: 0;
-            color: #aaa;
-        }
-        .drop-zone-icon svg { width: 18px; height: 18px; }
-        .drop-zone-text { flex: 1; min-width: 0; }
-        .drop-zone-text strong { font-size: 13px; color: #333; font-weight: 600; display: block; }
-        .drop-zone-text span { font-size: 12px; color: #aaa; }
+// loadTemplates loads HTML templates from the embedded filesystem.
+func loadTemplates() (*template.Template, error) {
+	tmpl := template.New("upload")
 
-        /* ── Selected file state ── */
-        .drop-zone.has-file {
-            border-style: solid;
-            border-color: #667eea;
-            background: #f6f7ff;
-            cursor: default;
-        }
-        .drop-zone.has-file .drop-zone-icon {
-            background: #667eea;
-            color: white;
-        }
-        .drop-zone.has-file .drop-zone-text strong { color: #1a1a1a; }
-        .drop-zone.has-file .drop-zone-text span { color: #888; }
-        .clear-btn {
-            display: none;
-            background: none;
-            border: none;
-            color: #bbb;
-            cursor: pointer;
-            padding: 4px;
-            border-radius: 4px;
-            width: auto;
-            font-size: 0;
-            flex-shrink: 0;
-            transition: color 0.15s;
-        }
-        .clear-btn:hover { color: #e74c3c; transform: none; box-shadow: none; }
-        .clear-btn svg { width: 16px; height: 16px; }
-        .drop-zone.has-file .clear-btn { display: flex; align-items: center; }
-        .drop-zone.has-file:hover { background: #f6f7ff; border-color: #667eea; }
+	// Read and parse the upload template
+	// When embedding a directory with //go:embed templates, files are accessed directly
+	uploadTmpl, err := templatesFS.ReadFile("templates/upload.html")
+	if err != nil {
+		return nil, fmt.Errorf("failed to read upload template: %w", err)
+	}
 
-        /* ── Advanced toggle ── */
-        .advanced-toggle {
-            display: flex;
-            align-items: center;
-            gap: 6px;
-            font-size: 12px;
-            color: #aaa;
-            cursor: pointer;
-            margin-bottom: 14px;
-            user-select: none;
-            width: fit-content;
-        }
-        .advanced-toggle:hover { color: #667eea; }
-        .advanced-toggle svg { width: 12px; height: 12px; transition: transform 0.2s; }
-        .advanced-toggle.open svg { transform: rotate(90deg); }
-        .advanced-body { display: none; margin-bottom: 14px; }
-        .advanced-body.open { display: block; }
-        .option-row {
-            display: flex;
-            align-items: flex-start;
-            gap: 8px;
-            font-size: 13px;
-            color: #555;
-            cursor: pointer;
-            line-height: 1.4;
-        }
-        .option-row input[type="checkbox"] { margin-top: 2px; flex-shrink: 0; cursor: pointer; accent-color: #667eea; }
-        .option-hint { color: #bbb; font-size: 12px; }
+	tmpl, err = tmpl.Parse(string(uploadTmpl))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse upload template: %w", err)
+	}
 
-        /* ── Buttons ── */
-        button {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            border: none;
-            padding: 12px 24px;
-            border-radius: 8px;
-            font-size: 14px;
-            font-weight: 600;
-            cursor: pointer;
-            width: 100%;
-            transition: transform 0.15s, box-shadow 0.15s, opacity 0.15s;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 8px;
-        }
-        button:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 6px 16px rgba(102,126,234,0.4); }
-        button:disabled { opacity: 0.5; cursor: not-allowed; }
-        .cancel-btn {
-            display: none;
-            margin-top: 8px;
-            background: none;
-            border: 1px solid #e0e0e0;
-            color: #999;
-            font-size: 13px;
-            font-weight: 500;
-            padding: 8px;
-            border-radius: 6px;
-        }
-        .cancel-btn:hover { border-color: #e74c3c; color: #e74c3c; transform: none; box-shadow: none; }
-        .loading .cancel-btn { display: flex; }
-        .loading button[type="submit"] { pointer-events: none; }
+	return tmpl, nil
+}
 
-        /* ── Spinner ── */
-        .spinner {
-            display: none;
-            width: 16px; height: 16px;
-            border: 2.5px solid rgba(255,255,255,0.35);
-            border-top-color: white;
-            border-radius: 50%;
-            animation: spin 0.7s linear infinite;
-            flex-shrink: 0;
-        }
-        @keyframes spin { to { transform: rotate(360deg); } }
-        .loading .spinner { display: block; }
-        .timer { color: #bbb; font-size: 12px; text-align: center; margin-top: 8px; display: none; }
-        .loading .timer { display: block; }
-
-        /* ── Result ── */
-        .result { padding: 12px 14px; border-radius: 8px; display: none; margin-top: 12px; font-size: 13px; }
-        .result.show { display: block; }
-        .result.error { background: #fff0f0; border: 1px solid #fcc; color: #c0392b; }
-
-        /* ── Log box ── */
-        .log-box { border: 1px solid #2d2d2d; border-radius: 10px; overflow: hidden; display: none; }
-        .log-box.visible { display: block; }
-        .log-box-header {
-            background: #2d2d2d; color: #666;
-            font-family: 'Courier New', monospace;
-            font-size: 10px; font-weight: 700;
-            letter-spacing: 0.1em; text-transform: uppercase;
-            padding: 5px 12px; user-select: none;
-        }
-        .logs {
-            background: #1a1a1a; color: #d4d4d4;
-            font-family: 'Courier New', monospace;
-            font-size: 12px; line-height: 1.6;
-            min-height: 48px; max-height: 280px;
-            overflow-y: auto;
-            padding: 8px 12px;
-            scrollbar-width: thin; scrollbar-color: #444 #1a1a1a;
-        }
-        .logs::-webkit-scrollbar { width: 5px; }
-        .logs::-webkit-scrollbar-track { background: #1a1a1a; }
-        .logs::-webkit-scrollbar-thumb { background: #3a3a3a; border-radius: 3px; }
-        .logs div { padding: 1px 0; white-space: pre-wrap; word-break: break-all; }
-        .logs div::before { content: '▸ '; color: #444; }
-
-        /* ── Summary panel ── */
-        .summary-card {
-            background: white; border-radius: 16px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            overflow: hidden; display: none;
-        }
-        .summary-card.visible { display: block; }
-        .summary-header {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white; padding: 14px 20px;
-            font-size: 13px; font-weight: 600; letter-spacing: 0.03em;
-        }
-        .summary-body { padding: 16px 20px; }
-        .stat-row {
-            display: flex; justify-content: space-between; align-items: baseline;
-            padding: 8px 0; border-bottom: 1px solid #f2f2f2; font-size: 13px;
-        }
-        .stat-row:last-child { border-bottom: none; }
-        .stat-label { color: #999; }
-        .stat-value { color: #222; font-weight: 600; text-align: right; max-width: 170px; word-break: break-all; }
-        .download-btn {
-            display: block; margin-top: 14px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white; text-align: center;
-            padding: 10px; border-radius: 8px;
-            font-weight: 600; font-size: 13px;
-            text-decoration: none; transition: opacity 0.2s;
-        }
-        .download-btn:hover { opacity: 0.88; }
-
-        @media (max-width: 680px) {
-            .page { flex-direction: column; }
-            .right { width: 100%; }
-        }
-    </style>
-</head>
-<body>
-    <div class="page">
-        <div class="left">
-            <div class="card">
-                <h1>Document to EPUB</h1>
-                <p class="subtitle">PDF, TXT, MD, HTML &middot; max 200 MB</p>
-
-                <form id="uploadForm" enctype="multipart/form-data">
-                    <!-- Drop zone -->
-                    <label class="drop-zone" id="dropZone">
-                        <div class="drop-zone-icon" id="dzIcon">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                                <polyline points="14 2 14 8 20 8"/>
-                            </svg>
-                        </div>
-                        <div class="drop-zone-text">
-                            <strong id="dzTitle">Click to choose or drop a file</strong>
-                            <span id="dzSub">PDF, TXT, Markdown, HTML</span>
-                        </div>
-                        <button type="button" class="clear-btn" id="clearBtn" title="Remove file">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
-                                <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-                            </svg>
-                        </button>
-                        <input type="file" id="fileInput" name="file" accept=".pdf,.txt,.md,.html">
-                    </label>
-
-                    <!-- Advanced options -->
-                    <div class="advanced-toggle" id="advancedToggle">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                            <polyline points="9 18 15 12 9 6"/>
-                        </svg>
-                        Advanced
-                    </div>
-                    <div class="advanced-body" id="advancedBody">
-                        <label class="option-row">
-                            <input type="checkbox" id="smartOcr" name="smart_ocr" value="true" checked>
-                            <span>Smart OCR <span class="option-hint">&mdash; detect garbled fonts and scan-based PDFs; re-render with OCR for cleaner text</span></span>
-                        </label>
-                        <label class="option-row" style="margin-top:8px">
-                            <input type="checkbox" id="forceOcr" name="force_ocr" value="true">
-                            <span>Force OCR <span class="option-hint">&mdash; always re-render pages, ignoring any embedded text (useful when Smart OCR isn&apos;t enough)</span></span>
-                        </label>
-                        <label class="option-row" style="margin-top:8px">
-                            <input type="checkbox" id="stripHeaders" name="strip_headers" value="true" checked>
-                            <span>Strip running headers <span class="option-hint">&mdash; remove repeated book/chapter titles printed at the top of each page</span></span>
-                        </label>
-                        <label class="option-row" style="margin-top:8px">
-                            <input type="checkbox" id="stripFootnotes" name="strip_footnotes" value="true" checked>
-                            <span>Strip footnotes <span class="option-hint">&mdash; remove footnote sections at the bottom of pages</span></span>
-                        </label>
-                        <label class="option-row" style="margin-top:8px">
-                            <input type="checkbox" id="textOnly" name="text_only" value="true">
-                            <span>Text only <span class="option-hint">&mdash; skip embedded image extraction; useful for scanned books with no real figures</span></span>
-                        </label>
-                    </div>
-
-                    <button type="submit" id="submitBtn" disabled>
-                        <span id="submitLabel">Convert to EPUB</span>
-                        <span class="spinner"></span>
-                    </button>
-                    <button type="button" class="cancel-btn" id="cancelBtn">Cancel</button>
-                    <div class="timer" id="timer"></div>
-                </form>
-
-                <div class="result" id="result"></div>
-            </div>
-
-            <div class="log-box" id="logBox">
-                <div class="log-box-header">conversion log</div>
-                <div class="logs" id="logs" aria-live="polite"></div>
-            </div>
-        </div>
-
-        <div class="right">
-            <div class="summary-card" id="summaryCard">
-                <div class="summary-header">Conversion Summary</div>
-                <div class="summary-body" id="summaryBody"></div>
-            </div>
-        </div>
-    </div>
-
-    <script>
-        const dropZone    = document.getElementById('dropZone');
-        const fileInput   = document.getElementById('fileInput');
-        const dzTitle     = document.getElementById('dzTitle');
-        const dzSub       = document.getElementById('dzSub');
-        const dzIcon      = document.getElementById('dzIcon');
-        const clearBtn    = document.getElementById('clearBtn');
-        const uploadForm  = document.getElementById('uploadForm');
-        const result      = document.getElementById('result');
-        const logBox      = document.getElementById('logBox');
-        const logsEl      = document.getElementById('logs');
-        const summaryCard = document.getElementById('summaryCard');
-        const summaryBody = document.getElementById('summaryBody');
-        const baseTitle   = document.title;
-        const smartOcrEl  = document.getElementById('smartOcr');
-        const submitBtn   = document.getElementById('submitBtn');
-        const submitLabel = document.getElementById('submitLabel');
-        const cancelBtn   = document.getElementById('cancelBtn');
-        const timerEl     = document.getElementById('timer');
-        const advToggle   = document.getElementById('advancedToggle');
-        const advBody     = document.getElementById('advancedBody');
-
-        let abortController = null;
-        let timerInterval   = null;
-        let dragDepth       = 0;
-
-        // ── Advanced toggle ──
-        advToggle.addEventListener('click', () => {
-            advToggle.classList.toggle('open');
-            advBody.classList.toggle('open');
-        });
-
-        // ── Drag & drop ──
-        document.addEventListener('dragover',  (e) => e.preventDefault());
-        document.addEventListener('dragenter', (e) => { e.preventDefault(); if (++dragDepth === 1) dropZone.classList.add('dragover'); });
-        document.addEventListener('dragleave', ()  => { if (--dragDepth <= 0) { dragDepth = 0; dropZone.classList.remove('dragover'); } });
-        document.addEventListener('drop', (e) => {
-            e.preventDefault();
-            dragDepth = 0;
-            dropZone.classList.remove('dragover');
-            const f = e.dataTransfer.files[0];
-            if (f) setFile(f);
-        });
-
-        fileInput.addEventListener('change', () => {
-            if (fileInput.files[0]) setFile(fileInput.files[0]);
-        });
-
-        clearBtn.addEventListener('click', (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            clearFile();
-        });
-
-        cancelBtn.addEventListener('click', () => {
-            if (abortController) abortController.abort();
-        });
-
-        function setFile(file) {
-            // Transfer to the hidden input when coming from drag-and-drop.
-            if (fileInput.files[0] !== file) {
-                const dt = new DataTransfer();
-                dt.items.add(file);
-                fileInput.files = dt.files;
-            }
-            dzTitle.textContent = file.name;
-            dzSub.textContent   = formatSize(file.size);
-            dropZone.classList.add('has-file');
-            submitBtn.disabled = false;
-            result.classList.remove('show');
-        }
-
-        function clearFile() {
-            fileInput.value = '';
-            dzTitle.textContent = 'Click to choose or drop a file';
-            dzSub.textContent   = 'PDF, TXT, Markdown, HTML';
-            dropZone.classList.remove('has-file');
-            submitBtn.disabled = true;
-        }
-
-        function formatSize(bytes) {
-            if (bytes < 1024) return bytes + '\u00a0B';
-            if (bytes < 1048576) return (bytes / 1024).toFixed(1) + '\u00a0KB';
-            return (bytes / 1048576).toFixed(1) + '\u00a0MB';
-        }
-
-        function appendLog(message) {
-            logBox.classList.add('visible');
-            const div = document.createElement('div');
-            div.textContent = message;
-            logsEl.appendChild(div);
-            logsEl.scrollTop = logsEl.scrollHeight;
-        }
-
-        function startTimer() {
-            const t0 = Date.now();
-            timerEl.textContent = '0s';
-            timerInterval = setInterval(() => {
-                timerEl.textContent = ((Date.now() - t0) / 1000).toFixed(0) + 's';
-            }, 1000);
-        }
-
-        function stopTimer() {
-            clearInterval(timerInterval);
-            timerInterval = null;
-            timerEl.textContent = '';
-        }
-
-        uploadForm.addEventListener('submit', async (e) => {
-            e.preventDefault();
-            if (!fileInput.files.length) { showResult('error', 'Please select a file'); return; }
-            if (fileInput.files[0].size > 200 * 1048576) { showResult('error', 'File exceeds 200\u00a0MB limit'); return; }
-
-            const formData = new FormData();
-            formData.append('file', fileInput.files[0]);
-            formData.append('smart_ocr', smartOcrEl.checked ? 'true' : 'false');
-            formData.append('force_ocr', document.getElementById('forceOcr').checked ? 'true' : 'false');
-            formData.append('strip_headers', document.getElementById('stripHeaders').checked ? 'true' : 'false');
-            formData.append('strip_footnotes', document.getElementById('stripFootnotes').checked ? 'true' : 'false');
-            formData.append('text_only', document.getElementById('textOnly').checked ? 'true' : 'false');
-
-            abortController = new AbortController();
-            uploadForm.classList.add('loading');
-            submitBtn.disabled = true;
-            submitLabel.textContent = 'Converting\u2026';
-            result.classList.remove('show');
-            logsEl.innerHTML = '';
-            logBox.classList.remove('visible');
-            summaryBody.innerHTML = '';
-            summaryCard.classList.add('visible');
-            document.title = baseTitle;
-            startTimer();
-
-            try {
-                const response = await fetch('/api/upload', {
-                    method: 'POST',
-                    body: formData,
-                    signal: abortController.signal,
-                });
-                const reader  = response.body.getReader();
-                const decoder = new TextDecoder();
-                let buf = '', finished = false;
-
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    buf += decoder.decode(value, { stream: true });
-                    const parts = buf.split('\n\n');
-                    buf = parts.pop();
-                    for (const part of parts) {
-                        const line = part.replace(/^data: /, '').trim();
-                        if (!line) continue;
-                        let evt;
-                        try { evt = JSON.parse(line); } catch { continue; }
-                        if (evt.type === 'log') {
-                            appendLog(evt.message);
-                        } else if (evt.type === 'done') {
-                            finished = true;
-                            document.title = '\u2713 ' + (evt.filename || 'Done') + ' \u2014 ' + baseTitle;
-                            showSummary(evt);
-                            summaryCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-                        } else if (evt.type === 'error') {
-                            finished = true;
-                            document.title = '\u2717 Failed \u2014 ' + baseTitle;
-                            showResult('error', evt.message || 'Conversion failed');
-                            summaryBody.innerHTML = '';
-                        }
-                    }
-                }
-                if (!finished) {
-                    document.title = '\u2717 Failed \u2014 ' + baseTitle;
-                    showResult('error', 'Connection lost \u2014 conversion may have failed');
-                    summaryBody.innerHTML = '';
-                }
-            } catch (err) {
-                if (err.name === 'AbortError') {
-                    document.title = baseTitle;
-                    showResult('error', 'Conversion cancelled.');
-                    summaryBody.innerHTML = '';
-                } else {
-                    document.title = '\u2717 Failed \u2014 ' + baseTitle;
-                    showResult('error', 'Network error: ' + err.message);
-                }
-            } finally {
-                abortController = null;
-                stopTimer();
-                uploadForm.classList.remove('loading');
-                submitBtn.disabled = !fileInput.files.length;
-                submitLabel.textContent = 'Convert to EPUB';
-            }
-        });
-
-        function showResult(type, message) {
-            result.className = 'result show ' + type;
-            result.textContent = message;
-        }
-
-        function showSummary(evt) {
-            const rows = [
-                ['File',       evt.filename     || '\u2014'],
-                ['Chapters',   evt.chapters  != null ? evt.chapters              : '\u2014'],
-                ['Characters', evt.chars     != null ? evt.chars.toLocaleString(): '\u2014'],
-                ['EPUB size',  evt.epub_kb   != null ? evt.epub_kb.toFixed(1) + '\u00a0KB' : '\u2014'],
-                ['Processing', evt.processing_ms != null ? (evt.processing_ms / 1000).toFixed(1) + 's' : '\u2014'],
-            ];
-            const frag = document.createDocumentFragment();
-            for (const [label, val] of rows) {
-                const row = document.createElement('div');
-                row.className = 'stat-row';
-                const l = document.createElement('span'); l.className = 'stat-label'; l.textContent = label;
-                const v = document.createElement('span'); v.className = 'stat-value'; v.textContent = val;
-                row.appendChild(l); row.appendChild(v);
-                frag.appendChild(row);
-            }
-            summaryBody.innerHTML = '';
-            summaryBody.appendChild(frag);
-            if (evt.download_url) {
-                const a = document.createElement('a');
-                a.className = 'download-btn';
-                a.href = evt.download_url;
-                a.download = evt.filename || '';
-                a.textContent = 'Download EPUB';
-                summaryBody.appendChild(a);
-            }
-        }
-    </script>
-</body>
-</html>`
-
-func NewWebHandler(docHandler *DocumentHandler, outputDir string) (*WebHandler, error) {
+func NewWebHandler(docHandler *DocumentHandler, outputDir string, securityCfg config.SecurityConfig, metricsCfg config.MetricsConfig, chapterWords int) (*WebHandler, error) {
 	persistent := outputDir != ""
 	if !persistent {
 		var err error
@@ -611,24 +83,55 @@ func NewWebHandler(docHandler *DocumentHandler, outputDir string) (*WebHandler, 
 		return nil, fmt.Errorf("failed to create output dir %q: %v", outputDir, err)
 	}
 
-	tmpl, err := template.New("upload").Parse(uploadPageHTML)
+	tmpl, err := loadTemplates()
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse template: %v", err)
+		return nil, fmt.Errorf("failed to load templates: %v", err)
 	}
 
-	epubGen := model.NewEPUBGenerator()
+	epubGen := model.NewEPUBGenerator(chapterWords)
 
 	return &WebHandler{
-		documentHandler:                    docHandler,
-		epubGenerator:                      epubGen,
-		uploadDir:                          outputDir,
-		templates:                          tmpl,
-		persistentDir:                      persistent,
-		UnimplementedDocumentServiceServer: pb.UnimplementedDocumentServiceServer{},
+		documentHandler: docHandler,
+		epubGenerator:   epubGen,
+		uploadDir:       outputDir,
+		templates:       tmpl,
+		persistentDir:   persistent,
+		securityCfg:     securityCfg,
+		metricsCfg:      metricsCfg,
 	}, nil
 }
 
 func (h *WebHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Check if authentication is required for this endpoint
+	var protectedPaths = map[string]bool{
+		"/api/upload": true,
+		"/download":   true,
+	}
+
+	path := r.URL.Path
+	isProtected := protectedPaths[path]
+
+	// Apply auth middleware if this is a protected endpoint
+	if isProtected && h.securityCfg.BasicAuth != "" {
+		// Create a basic auth wrapper for this specific handler
+		authHandler := middleware.BasicAuth(&h.securityCfg, http.HandlerFunc(h.servePath))
+		authHandler.ServeHTTP(w, r)
+		return
+	}
+
+	// No auth needed - serve directly
+	h.servePath(w, r)
+}
+
+// servePath handles routing to the appropriate handler based on URL path.
+// This is separated from ServeHTTP to allow auth middleware to wrap it.
+func (h *WebHandler) servePath(w http.ResponseWriter, r *http.Request) {
+	// Handle metrics endpoint separately - no auth required, uses promhttp
+	if h.metricsCfg.Enabled && r.URL.Path == h.metricsCfg.Path {
+		promhttp.Handler().ServeHTTP(w, r)
+		return
+	}
+
 	switch r.URL.Path {
 	case "/", "/upload":
 		h.serveUploadPage(w, r)
@@ -636,19 +139,97 @@ func (h *WebHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleUpload(w, r)
 	case "/download":
 		h.handleDownload(w, r)
+	case "/health/live":
+		h.handleLiveness(w, r)
+	case "/health/ready":
+		h.handleReadiness(w, r)
+	case "/version":
+		h.handleVersion(w, r)
 	default:
 		http.NotFound(w, r)
 	}
 }
 
+// handleLiveness returns a simple OK response indicating the service is running.
+func (h *WebHandler) handleLiveness(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(http.StatusOK)
+	//nolint:errcheck // simple response, ignore write error
+	w.Write([]byte("OK"))
+}
+
+// handleReadiness checks if the service is ready to accept requests.
+func (h *WebHandler) handleReadiness(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	// Check if upload directory is accessible
+	if err := h.checkUploadDir(); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		//nolint:errcheck // JSON response, ignore write error
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "not ready",
+			"error":  err.Error(),
+		})
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	//nolint:errcheck // JSON response, ignore write error
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "ready",
+	})
+}
+
+// checkUploadDir verifies the upload directory is accessible for writes.
+func (h *WebHandler) checkUploadDir() error {
+	// Try to create a temp file to verify write access
+	testFile, err := os.CreateTemp(h.uploadDir, "healthcheck_*")
+	if err != nil {
+		return fmt.Errorf("upload dir not writable: %v", err)
+	}
+	name := testFile.Name()
+	testFile.Close()
+	if err := os.Remove(name); err != nil {
+		return fmt.Errorf("failed to cleanup test file: %v", err)
+	}
+	return nil
+}
+
+// handleVersion returns build information.
+func (h *WebHandler) handleVersion(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	info := map[string]interface{}{
+		"version":   Version,
+		"commit":    Commit,
+		"buildTime": BuildTime,
+		"goVersion": runtime.Version(),
+	}
+
+	//nolint:errcheck // JSON response, ignore write error
+	json.NewEncoder(w).Encode(info)
+}
+
 func (h *WebHandler) serveUploadPage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
 	if err := h.templates.Execute(w, nil); err != nil {
-		log.Printf("template execute error: %v", err)
+		errors.LogWarn("template execute error: %v", err)
+		// Don't return error to client - template errors are rare and the page
+		// may have partially rendered. Just log and continue.
 	}
 }
 
 func (h *WebHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
+	// Start tracing span for the upload request
+	ctx, span := tracing.StartSpan(r.Context(), "handleUpload",
+		trace.WithAttributes(
+			attribute.String("http.method", r.Method),
+			attribute.String("http.url", r.URL.String()),
+		),
+	)
+	defer span.End()
+
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -668,13 +249,21 @@ func (h *WebHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	reqID, _ := randomHex(4) // correlation ID for log correlation; ignore error, empty string is fine
 
+	// Add correlation ID to tracing context
+	ctx = tracing.ContextWithCorrelationID(ctx, reqID)
+
 	jsonStr := func(s string) string {
 		b, _ := json.Marshal(s)
 		return string(b)
 	}
+	// sseMu serializes writes to w: OCR goroutines call logf concurrently and
+	// http.ResponseWriter is not goroutine-safe.
+	var sseMu sync.Mutex
 	sendEvent := func(typ, payload string) {
 		// Escape newlines so SSE frame boundaries (\n\n) are never broken.
 		payload = strings.ReplaceAll(payload, "\n", " ")
+		sseMu.Lock()
+		defer sseMu.Unlock()
 		fmt.Fprintf(w, "data: {\"type\":%s,\"message\":%s}\n\n", jsonStr(typ), jsonStr(payload))
 		flusher.Flush()
 	}
@@ -726,7 +315,7 @@ func (h *WebHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Process with a 10-minute timeout.
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 
 	logf := func(format string, args ...any) {
@@ -758,7 +347,7 @@ func (h *WebHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 	goroutineTookOwnership = true
 	go func() {
 		defer os.Remove(uploadPath)
-		doc, err := h.documentHandler.Processor.ProcessDocumentFromPath(uploadPath, mimeType, opts, logf)
+		doc, err := h.documentHandler.Processor.ProcessDocumentFromPath(ctx, uploadPath, mimeType, opts, logf)
 		resCh <- procResult{doc, err}
 	}()
 
@@ -793,7 +382,7 @@ func (h *WebHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		sendEvent("error", "server error generating filename")
 		return
 	}
-	filename := fmt.Sprintf("%s_%s.epub", strings.ReplaceAll(title, " ", "_"), randSuffix)
+	filename := fmt.Sprintf("%s_%s.epub", sanitizeFilename(title), randSuffix)
 	epubPath := filepath.Join(h.uploadDir, filename)
 	if err := h.generateEPUBFile(epubResult, epubPath); err != nil {
 		logf("EPUB file error: %v", err)
@@ -819,7 +408,7 @@ func (h *WebHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		EpubKB       float64 `json:"epub_kb"`
 		ProcessingMs int64   `json:"processing_ms"`
 	}
-	doneJSON, _ := json.Marshal(doneEvent{
+	doneJSON, err := json.Marshal(doneEvent{
 		Type:         "done",
 		DownloadURL:  "/download?file=" + url.QueryEscape(filename),
 		Filename:     filename,
@@ -828,8 +417,32 @@ func (h *WebHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		EpubKB:       epubKB,
 		ProcessingMs: docResult.ProcessingMs,
 	})
+	if err != nil {
+		logf("JSON marshal error: %v", err)
+		sendEvent("error", "internal server error")
+		return
+	}
 	fmt.Fprintf(w, "data: %s\n\n", doneJSON)
 	flusher.Flush()
+}
+
+// sanitizeFilename strips directory components from name and replaces any
+// character that is not alphanumeric, a hyphen, or a dot with an underscore.
+// This prevents path traversal when the result is used in filepath.Join.
+func sanitizeFilename(name string) string {
+	name = filepath.Base(name)
+	var b strings.Builder
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '.' {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('_')
+		}
+	}
+	if s := b.String(); s != "" && s != "." {
+		return s
+	}
+	return "document"
 }
 
 func randomHex(n int) (string, error) {
@@ -847,18 +460,14 @@ func (h *WebHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	safeName := filepath.Base(filename)
-	if filepath.Ext(safeName) != ".epub" {
-		http.Error(w, "invalid file", http.StatusBadRequest)
-		return
-	}
-	filePath := filepath.Join(h.uploadDir, safeName)
-	if !strings.HasPrefix(filepath.Clean(filePath)+string(filepath.Separator), filepath.Clean(h.uploadDir)+string(filepath.Separator)) {
-		http.Error(w, "invalid file", http.StatusBadRequest)
+	// Validate and sanitize the filename
+	validatedPath, err := h.validateDownloadPath(filename)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	f, err := os.Open(filePath)
+	f, err := os.Open(validatedPath)
 	if err != nil {
 		http.Error(w, "File not found", http.StatusNotFound)
 		return
@@ -871,9 +480,59 @@ func (h *WebHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	safeName := filepath.Base(validatedPath)
 	w.Header().Set("Content-Type", "application/epub+zip")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", safeName))
 	http.ServeContent(w, r, safeName, fi.ModTime(), f)
+}
+
+// validateDownloadPath performs comprehensive path traversal protection.
+// It returns the validated absolute path or an error if the path is invalid.
+func (h *WebHandler) validateDownloadPath(filename string) (string, error) {
+	// Step 0: Check for path traversal attempts and absolute paths in the original filename
+	// This catches both raw ".." and URL-encoded "%2e%2e" (which becomes ".." after HTTP decoding)
+	// Also rejects absolute paths which could bypass Base() checks
+	if strings.Contains(filename, "..") || strings.Contains(filename, "%2e%2e") || filepath.IsAbs(filename) {
+		return "", fmt.Errorf("invalid file")
+	}
+
+	// Step 1: Strip directory components using filepath.Base
+	safeName := filepath.Base(filename)
+
+	// Step 2: Explicit check for ".." sequences (defense in depth)
+	// This catches attempts like "../etc/passwd" or "foo/../../bar"
+	if strings.Contains(safeName, "..") {
+		return "", fmt.Errorf("invalid file")
+	}
+
+	// Step 3: Verify extension is .epub only
+	if filepath.Ext(safeName) != ".epub" {
+		return "", fmt.Errorf("invalid file")
+	}
+
+	// Step 4: Build the full path
+	filePath := filepath.Join(h.uploadDir, safeName)
+
+	// Step 5: Canonicalize the path to resolve any symlinks or relative components
+	// filepath.Clean normalizes the path (removes redundant separators, etc.)
+	cleanPath := filepath.Clean(filePath)
+
+	// Step 6: Canonicalize the base directory for comparison
+	cleanBase := filepath.Clean(h.uploadDir)
+
+	// Step 7: Verify the resolved path is within the allowed directory
+	// Use explicit prefix check with trailing separator to prevent partial matches
+	// e.g., "/uploads/evil" should not match prefix "/uploads/ev"
+	if !strings.HasPrefix(cleanPath+string(filepath.Separator), cleanBase+string(filepath.Separator)) {
+		return "", fmt.Errorf("invalid file")
+	}
+
+	// Step 8: Additional check - ensure the final path doesn't contain ".." after cleaning
+	if strings.Contains(cleanPath, "..") {
+		return "", fmt.Errorf("invalid file")
+	}
+
+	return cleanPath, nil
 }
 
 // epubZip wraps zip.Writer and propagates the first write error so callers
@@ -1067,14 +726,21 @@ func (h *WebHandler) generateEPUBFile(epubResult *model.EPUBResult, outPath stri
 				break
 			}
 		}
-		// Apply insertions from highest offset to lowest so preceding offsets
-		// remain valid as we splice the string.
+		// Apply insertions in a single pass (ascending offset order) to avoid
+		// O(n²) string allocation from repeated slicing.
 		sort.Slice(insertions, func(i, j int) bool {
-			return insertions[i].pos > insertions[j].pos
+			return insertions[i].pos < insertions[j].pos
 		})
+		var spliced strings.Builder
+		spliced.Grow(len(bodyHTML))
+		prev := 0
 		for _, ins := range insertions {
-			bodyHTML = bodyHTML[:ins.pos] + ins.block + bodyHTML[ins.pos:]
+			spliced.WriteString(bodyHTML[prev:ins.pos])
+			spliced.WriteString(ins.block)
+			prev = ins.pos
 		}
+		spliced.WriteString(bodyHTML[prev:])
+		bodyHTML = spliced.String()
 
 		// Append any images that couldn't be placed inline (no matching caption
 		// found in text) as a fallback gallery at chapter end.

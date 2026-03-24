@@ -9,19 +9,21 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"syscall"
 	"time"
 
+	"epublic8/internal/config"
 	"epublic8/internal/handler"
+	"epublic8/internal/metrics"
 	"epublic8/internal/model"
+	"epublic8/internal/tracing"
 	"google.golang.org/grpc"
 )
 
 const pidFile = "document-service.pid"
 
 func writePID() {
-	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0600); err != nil {
+	if err := os.WriteFile(pidFile, []byte(fmt.Sprintf("%d", os.Getpid())), 0600); err != nil {
 		log.Printf("warning: could not write PID file: %v", err)
 	}
 }
@@ -34,9 +36,26 @@ func main() {
 	writePID()
 	defer removePID()
 
-	grpcPort := getEnv("GRPC_PORT", "50051")
-	httpPort := getEnv("HTTP_PORT", "8080")
-	outputDir := getEnv("OUTPUT_DIR", "")
+	// Load configuration from file and environment variables
+	cfg, err := config.LoadFromFlag()
+	if err != nil {
+		log.Fatalf("failed to load config: %v", err)
+	}
+
+	log.Printf("Using configuration:\n%s", cfg.String())
+
+	// Initialize tracing
+	tracingCleanup, err := tracing.Init(cfg.Tracing)
+	if err != nil {
+		log.Printf("warning: failed to initialize tracing: %v", err)
+	}
+	if tracingCleanup != nil {
+		defer func() {
+			if err := tracingCleanup(); err != nil {
+				log.Printf("warning: tracing cleanup error: %v", err)
+			}
+		}()
+	}
 
 	grpcServer := grpc.NewServer(
 		grpc.MaxRecvMsgSize(100 * 1024 * 1024),
@@ -44,12 +63,12 @@ func main() {
 
 	model.LogToolAvailability(log.Printf)
 
-	docHandler := handler.NewDocumentHandler()
+	docHandler := handler.NewDocumentHandler(cfg.OCR.Concurrency, cfg.OCR.Languages)
 	defer docHandler.Close()
 
 	docHandler.Register(grpcServer)
 
-	webHandler, err := handler.NewWebHandler(docHandler, outputDir)
+	webHandler, err := handler.NewWebHandler(docHandler, cfg.EPUB.OutputDir, cfg.Security, cfg.Metrics, cfg.EPUB.ChapterWords)
 	if err != nil {
 		log.Fatalf("failed to initialize web handler: %v", err)
 	}
@@ -57,36 +76,37 @@ func main() {
 
 	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
 	defer cleanupCancel()
-	if outputDir != "" {
-		go cleanupLoop(cleanupCtx, outputDir)
+	if cfg.EPUB.OutputDir != "" && cfg.Cleanup.Enabled {
+		go cleanupLoop(cleanupCtx, cfg.EPUB.OutputDir, cfg.Cleanup.RetentionHours, cfg.Cleanup.IntervalHours)
 	}
 
 	go func() {
-		lis, err := net.Listen("tcp", ":"+grpcPort)
+		lis, err := net.Listen("tcp", ":"+cfg.Server.GRPCPort)
 		if err != nil {
 			log.Fatalf("failed to listen on grpc port: %v", err)
 		}
-		log.Printf("gRPC server listening on :%s", grpcPort)
+		log.Printf("gRPC server listening on :%s", cfg.Server.GRPCPort)
 		if err := grpcServer.Serve(lis); err != nil {
 			log.Fatalf("failed to serve grpc: %v", err)
 		}
 	}()
 
 	httpServer := &http.Server{
-		Addr:              ":" + httpPort,
-		Handler:           http.HandlerFunc(webHandler.ServeHTTP),
+		Addr:              ":" + cfg.Server.HTTPPort,
+		Handler:           metrics.Middleware(http.HandlerFunc(webHandler.ServeHTTP)),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	go func() {
-		log.Printf("HTTP server listening on :%s", httpPort)
+		log.Printf("HTTP server listening on :%s", cfg.Server.HTTPPort)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("failed to serve http: %v", err)
 		}
 	}()
 
 	fmt.Printf("Document Processing Service ready:\n")
-	fmt.Printf("  gRPC: :%s\n", grpcPort)
-	fmt.Printf("  HTTP:  http://localhost:%s\n", httpPort)
+	fmt.Printf("  gRPC: :%s\n", cfg.Server.GRPCPort)
+	fmt.Printf("  HTTP:  http://localhost:%s\n", cfg.Server.HTTPPort)
+	fmt.Printf("  OCR Languages: %v\n", cfg.OCR.Languages)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -113,16 +133,18 @@ func main() {
 	}
 }
 
-// cleanupLoop deletes EPUBs older than EPUB_RETENTION_HOURS (default 24) from
-// dir, running every EPUB_CLEANUP_INTERVAL_HOURS (default 1). Exits on ctx cancel.
-func cleanupLoop(ctx context.Context, dir string) {
-	retention := time.Duration(getEnvInt("EPUB_RETENTION_HOURS", 24)) * time.Hour
-	interval := time.Duration(getEnvInt("EPUB_CLEANUP_INTERVAL_HOURS", 1)) * time.Hour
+// cleanupLoop deletes EPUBs older than retentionHours from
+// dir, running every intervalHours. Exits on ctx cancel.
+func cleanupLoop(ctx context.Context, dir string, retentionHours, intervalHours int) {
+	retention := time.Duration(retentionHours) * time.Hour
+	interval := time.Duration(intervalHours) * time.Hour
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(interval):
+		case <-ticker.C:
 		}
 		entries, err := os.ReadDir(dir)
 		if err != nil {
@@ -147,21 +169,4 @@ func cleanupLoop(ctx context.Context, dir string) {
 			}
 		}
 	}
-}
-
-func getEnvInt(key string, defaultVal int) int {
-	if s := os.Getenv(key); s != "" {
-		if n, err := strconv.Atoi(s); err == nil && n > 0 {
-			return n
-		}
-		log.Printf("warning: invalid value for %s, using default %d", key, defaultVal)
-	}
-	return defaultVal
-}
-
-func getEnv(key, defaultValue string) string {
-	if value, exists := os.LookupEnv(key); exists {
-		return value
-	}
-	return defaultValue
 }
