@@ -256,3 +256,105 @@ func TestHealthCheck(t *testing.T) {
 // Note: ProcessDocument and StreamProcessDocument are harder to test without
 // actual PDF content or mock setup, so they're covered by integration tests
 // or tested through the HTTP handlers.
+
+func TestProcessDocumentPlainText(t *testing.T) {
+	h := NewDocumentHandler(0, nil)
+
+	req := &epb.DocumentRequest{
+		DocumentId: "test-doc-1",
+		Content:    []byte("Hello world. This is a test document."),
+		MimeType:   "text/plain",
+	}
+
+	resp, err := h.ProcessDocument(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if resp.DocumentId != "test-doc-1" {
+		t.Errorf("expected DocumentId 'test-doc-1', got %q", resp.DocumentId)
+	}
+	if resp.ExtractedText != "Hello world. This is a test document." {
+		t.Errorf("unexpected extracted text: %q", resp.ExtractedText)
+	}
+	if resp.Stats.ProcessingTimeMs < 0 {
+		t.Errorf("expected non-negative processing time, got %d", resp.Stats.ProcessingTimeMs)
+	}
+	if resp.Metadata.DetectedLanguage == "" {
+		t.Error("expected non-empty detected language")
+	}
+}
+
+func TestProcessDocumentMarkdown(t *testing.T) {
+	h := NewDocumentHandler(0, nil)
+
+	req := &epb.DocumentRequest{
+		DocumentId: "test-md",
+		Content:    []byte("# Title\n\nSome markdown content."),
+		MimeType:   "text/markdown",
+	}
+
+	resp, err := h.ProcessDocument(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if resp.ExtractedText != "# Title\n\nSome markdown content." {
+		t.Errorf("unexpected extracted text: %q", resp.ExtractedText)
+	}
+}
+
+func TestProcessDocumentWithOCROption(t *testing.T) {
+	h := NewDocumentHandler(0, nil)
+
+	req := &epb.DocumentRequest{
+		DocumentId: "test-ocr",
+		Content:    []byte("Test with OCR enabled"),
+		MimeType:   "text/plain",
+		Options:    &epb.ProcessOptions{EnableOcr: true},
+	}
+
+	resp, err := h.ProcessDocument(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if resp.ExtractedText != "Test with OCR enabled" {
+		t.Errorf("unexpected extracted text: %q", resp.ExtractedText)
+	}
+}
+
+func TestHealthCheckWithActiveRequests(t *testing.T) {
+	h := NewDocumentHandler(0, nil)
+
+	// Simulate an active request
+	h.incrementRequests()
+
+	req := &epb.HealthRequest{}
+	resp, err := h.Health(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if resp.ActiveRequests != 1 {
+		t.Errorf("expected 1 active request, got %d", resp.ActiveRequests)
+	}
+
+	h.decrementRequests()
+
+	// Verify it decremented
+	resp2, err := h.Health(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp2.ActiveRequests != 0 {
+		t.Errorf("expected 0 active requests after decrement, got %d", resp2.ActiveRequests)
+	}
+}
+
+func TestHandlerClose(t *testing.T) {
+	h := NewDocumentHandler(0, nil)
+	if err := h.Close(); err != nil {
+		t.Errorf("unexpected error on close: %v", err)
+	}
+}

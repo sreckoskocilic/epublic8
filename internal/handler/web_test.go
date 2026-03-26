@@ -48,8 +48,9 @@ func TestTextToHTMLSoftHyphenJoined(t *testing.T) {
 
 func TestTextToHTMLHyphenLineBreakJoined(t *testing.T) {
 	got := textToHTML("auto-\nmatic")
-	if !strings.Contains(got, "auto-matic") {
-		t.Errorf("expected hyphenated word rejoined, got: %s", got)
+	// Line-break hyphens are removed: "auto-\nmatic" → "automatic"
+	if !strings.Contains(got, "automatic") {
+		t.Errorf("expected hyphen removed on line break, got: %s", got)
 	}
 }
 

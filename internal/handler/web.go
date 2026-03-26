@@ -27,6 +27,7 @@ import (
 	"epublic8/internal/config"
 	"epublic8/internal/errors"
 	"epublic8/internal/handler/middleware"
+	"epublic8/internal/metrics"
 	"epublic8/internal/model"
 	"epublic8/internal/tracing"
 
@@ -139,13 +140,13 @@ func (h *WebHandler) pruneLimiters() {
 	}
 }
 
-func (h *WebHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Check if authentication is required for this endpoint
-	var protectedPaths = map[string]bool{
-		"/api/upload": true,
-		"/download":   true,
-	}
+// protectedPaths are endpoints that require authentication when configured.
+var protectedPaths = map[string]bool{
+	"/api/upload": true,
+	"/download":   true,
+}
 
+func (h *WebHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	isProtected := protectedPaths[path]
 
@@ -400,8 +401,10 @@ func (h *WebHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	goroutineTookOwnership = true
+	metrics.IncDocumentsInProgress()
 	go func() {
 		defer os.Remove(uploadPath)
+		defer metrics.DecDocumentsInProgress()
 		defer func() {
 			if r := recover(); r != nil {
 				resCh <- procResult{nil, fmt.Errorf("internal error: %v", r)}
@@ -435,7 +438,7 @@ func (h *WebHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 	} else if len([]rune(author)) > 200 {
 		author = string([]rune(author)[:200])
 	}
-	epubResult, err := h.epubGenerator.GenerateFromText(docResult.ExtractedText, docResult.Images, docResult.PageCount, title, author)
+	epubResult, err := h.epubGenerator.GenerateFromText(docResult.ExtractedText, docResult.Images, docResult.PageCount, title, author, docResult.Language)
 	if err != nil {
 		logf("EPUB generation error: %v", err)
 		sendEvent("error", err.Error())
@@ -696,13 +699,19 @@ func (h *WebHandler) generateEPUBFile(epubResult *model.EPUBResult, outPath stri
 			strings.TrimSuffix(img.Name, filepath.Ext(img.Name)), img.Name, img.MimeType)
 	}
 
+	// Format as a standards-compliant UUID (RFC 4122 §3): 8-4-4-4-12.
+	// crypto/rand failure is practically impossible; fall back to nil UUID.
+	bookID := "00000000-0000-0000-0000-000000000000"
+	if h, err := randomHex(16); err == nil {
+		bookID = h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+	}
 	fmt.Fprintf(z.create("OEBPS/content.opf"), `<?xml version="1.0" encoding="UTF-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" unique-identifier="bookid" version="2.0">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
     <dc:title>%s</dc:title>
     <dc:creator>%s</dc:creator>
     <dc:language>%s</dc:language>
-    <dc:identifier id="bookid">%s</dc:identifier>
+    <dc:identifier id="bookid">urn:uuid:%s</dc:identifier>
   </metadata>
   <manifest>
 %s  </manifest>
@@ -712,7 +721,7 @@ func (h *WebHandler) generateEPUBFile(epubResult *model.EPUBResult, outPath stri
 		template.HTMLEscapeString(epubResult.Title),
 		template.HTMLEscapeString(epubResult.Author),
 		epubResult.Language,
-		template.HTMLEscapeString(epubResult.Title),
+		bookID,
 		manifest.String(), spine.String())
 
 	fmt.Fprintf(z.create("OEBPS/toc.ncx"), `<?xml version="1.0" encoding="UTF-8"?>
@@ -847,20 +856,15 @@ func (h *WebHandler) generateEPUBFile(epubResult *model.EPUBResult, outPath stri
 func textToHTML(text string) string {
 	// 1. Join soft-hyphenated breaks: "wor­\nld" → "world", "wor-\nld" → "world"
 	text = strings.ReplaceAll(text, "\u00ad\n", "") // soft hyphen
-	text = strings.ReplaceAll(text, "-\n", "-")
+	text = strings.ReplaceAll(text, "-\n", "")      // line-break hyphen
 
 	// 2. Split into lines and detect paragraph boundaries.
 	lines := strings.Split(text, "\n")
 	var paragraphs []string
 	var current strings.Builder
 
-	sentenceEnd := func(s string) bool {
-		if s == "" {
-			return false
-		}
-		runes := []rune(s)
-		last := runes[len(runes)-1]
-		return last == '.' || last == '?' || last == '!' || last == '"' || last == '\'' || last == '\u201d' || last == '»'
+	sentenceEnd := func(r rune) bool {
+		return r == '.' || r == '?' || r == '!' || r == '"' || r == '\'' || r == '\u201d' || r == '»'
 	}
 	paraStart := func(s string) bool {
 		if s == "" {
@@ -874,11 +878,16 @@ func textToHTML(text string) string {
 			(first >= 0x00C0 && first <= 0x024F) // Latin extended uppercase (Č Š Ž Ć Đ…)
 	}
 
+	// lastRune tracks the last rune appended to current for sentence-end detection.
+	// This avoids O(n²) from calling current.String() on every line.
+	var lastRune rune
+
 	flush := func() {
 		if s := strings.TrimSpace(current.String()); s != "" {
-			paragraphs = append(paragraphs, s) // unescaped; escape happens at render time
+			paragraphs = append(paragraphs, s)
 		}
 		current.Reset()
+		lastRune = 0
 	}
 
 	for _, line := range lines {
@@ -892,14 +901,16 @@ func textToHTML(text string) string {
 
 		if current.Len() > 0 {
 			// Decide: continue current paragraph or start a new one?
-			prev := strings.TrimSpace(current.String())
-			if sentenceEnd(prev) && paraStart(trimmed) {
+			if sentenceEnd(lastRune) && paraStart(trimmed) {
 				flush()
 			} else {
 				current.WriteString(" ")
 			}
 		}
 		current.WriteString(trimmed)
+		// Track last rune of trimmed text for next iteration.
+		runes := []rune(trimmed)
+		lastRune = runes[len(runes)-1]
 	}
 	flush()
 

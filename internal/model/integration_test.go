@@ -17,7 +17,7 @@ Number: 123-456-7890
 Math: 1 + 2 = 3
 Ellipsis...`
 
-		result, err := g.GenerateFromText(inputText, nil, 5, "Special Chars", "Autor")
+		result, err := g.GenerateFromText(inputText, nil, 5, "Special Chars", "Autor", "hr")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}

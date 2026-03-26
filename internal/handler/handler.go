@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"sync/atomic"
+	"time"
 
 	"epublic8/internal/model"
 	"epublic8/internal/tracing"
@@ -19,6 +20,9 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+// processTimeout is the maximum time allowed for a single document processing request.
+const processTimeout = 10 * time.Minute
 
 // Pre-compiled entity extraction patterns, keyed by entity type.
 var entityPatterns = map[string][]*regexp.Regexp{
@@ -89,6 +93,10 @@ func (h *DocumentHandler) ProcessDocument(ctx context.Context, req *pb.DocumentR
 
 	h.incrementRequests()
 	defer h.decrementRequests()
+
+	// Enforce a processing timeout matching the HTTP path.
+	ctx, cancel := context.WithTimeout(ctx, processTimeout)
+	defer cancel()
 
 	opts := model.DefaultProcessOptions()
 	if req.Options != nil {
@@ -166,6 +174,8 @@ func (h *DocumentHandler) StreamProcessDocument(stream pb.DocumentService_Stream
 	if chunkOptions != nil {
 		streamOpts.ForceOCR = chunkOptions.EnableOcr
 	}
+	ctx, cancel := context.WithTimeout(ctx, processTimeout)
+	defer cancel()
 	result, err := h.Processor.ProcessDocument(ctx, buf.Bytes(), mimeType, streamOpts, log.Printf)
 	if err != nil {
 		tracing.AddSpanError(ctx, err)

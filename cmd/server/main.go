@@ -63,13 +63,11 @@ func main() {
 	if err != nil {
 		log.Printf("warning: failed to initialize tracing: %v", err)
 	}
-	if tracingCleanup != nil {
-		defer func() {
-			if err := tracingCleanup(); err != nil {
-				log.Printf("warning: tracing cleanup error: %v", err)
-			}
-		}()
-	}
+	defer func() {
+		if err := tracingCleanup(); err != nil {
+			log.Printf("warning: tracing cleanup error: %v", err)
+		}
+	}()
 
 	grpcServer := grpc.NewServer(
 		grpc.MaxRecvMsgSize(100 * 1024 * 1024),
@@ -107,7 +105,8 @@ func main() {
 
 	httpServer := &http.Server{
 		Addr:              ":" + cfg.Server.HTTPPort,
-		Handler:           metrics.Middleware(http.HandlerFunc(webHandler.ServeHTTP)),
+		Handler:           metrics.Middleware(cfg.Metrics.Path, http.HandlerFunc(webHandler.ServeHTTP)),
+		ReadTimeout:       60 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}

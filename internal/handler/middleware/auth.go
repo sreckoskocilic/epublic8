@@ -4,6 +4,7 @@ package middleware
 import (
 	"crypto/subtle"
 	"encoding/base64"
+	"log"
 	"net/http"
 	"strings"
 
@@ -28,7 +29,8 @@ func BasicAuth(cfg *config.SecurityConfig, next http.Handler) http.Handler {
 	// Parse the credentials: "username:password" or "username:hashed_password"
 	parts := strings.SplitN(cfg.BasicAuth, ":", 2)
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		// Invalid config - log and treat as no auth
+		// Invalid config - log warning and treat as no auth (fail open for availability)
+		log.Printf("WARNING: malformed BASIC_AUTH config (expected 'username:password'), authentication disabled")
 		return next
 	}
 

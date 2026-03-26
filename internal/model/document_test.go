@@ -399,7 +399,7 @@ func TestAssignImagesToChaptersZeroTotalPages(t *testing.T) {
 
 func TestGenerateFromTextBasic(t *testing.T) {
 	g := newGenerator()
-	result, err := g.GenerateFromText("Glava 1\nFirst chapter.\nGlava 2\nSecond chapter.", nil, 0, "Test", "Author")
+	result, err := g.GenerateFromText("Glava 1\nFirst chapter.\nGlava 2\nSecond chapter.", nil, 0, "Test", "Author", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -416,13 +416,37 @@ func TestGenerateFromTextBasic(t *testing.T) {
 
 func TestGenerateFromTextEmpty(t *testing.T) {
 	g := newGenerator()
-	result, err := g.GenerateFromText("", nil, 0, "Empty", "")
+	result, err := g.GenerateFromText("", nil, 0, "Empty", "", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if result == nil {
 		t.Fatal("expected non-nil result")
 	}
+}
+
+func TestGenerateFromTextLanguage(t *testing.T) {
+	g := newGenerator()
+
+	t.Run("passes language through", func(t *testing.T) {
+		result, err := g.GenerateFromText("Some text.", nil, 0, "Book", "Author", "hr")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Language != "hr" {
+			t.Errorf("expected language 'hr', got %q", result.Language)
+		}
+	})
+
+	t.Run("defaults to en when empty", func(t *testing.T) {
+		result, err := g.GenerateFromText("Some text.", nil, 0, "Book", "Author", "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Language != "en" {
+			t.Errorf("expected language 'en' for empty string, got %q", result.Language)
+		}
+	})
 }
 
 // --- NewDocumentProcessor / ProcessDocument ---
@@ -685,16 +709,6 @@ func TestSplitByWordCountOverBoundary(t *testing.T) {
 	if len(chapters) < 2 {
 		t.Errorf("expected at least 2 chapters, got %d", len(chapters))
 	}
-}
-
-func TestSanitizeFilename(t *testing.T) {
-	// This is tested in web_test.go but we can add more edge cases here
-	// The sanitizeFilename function is in web.go, so we test it via the handler
-}
-
-func TestDedupEntities(t *testing.T) {
-	// Test deduplication logic via handler tests
-	// This is covered in handler_test.go
 }
 
 func TestAssignImagesToChaptersWithImagesOnChapterBoundaries(t *testing.T) {

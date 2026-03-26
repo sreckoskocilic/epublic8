@@ -116,12 +116,10 @@ kubectl rollout restart deployment/document-service
 service DocumentService {
   rpc ProcessDocument(DocumentRequest) returns (DocumentResponse);
   rpc StreamProcessDocument(stream DocumentChunk) returns (stream DocumentChunkResponse);
-  rpc ExtractEntities(EntityRequest) returns (EntityResponse);  // not implemented
-  rpc Health(HealthRequest) returns (HealthResponse);
-}
+  rpc ExtractEntities(EntityRequest) returns (EntityResponse);
 ```
 
-`ExtractEntities` is defined in the proto but currently returns `codes.Unimplemented`.
+`ExtractEntities` uses regex-based pattern matching to identify PERSON, LOCATION, ORGANIZATION, DATE, EMAIL, and PHONE entities. It accepts a 1 MB text limit and returns deduplicated results with confidence scores.
 
 ### HTTP
 

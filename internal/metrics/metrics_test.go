@@ -90,7 +90,7 @@ func TestMiddleware(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 		})
 
-		handler := Middleware(next)
+		handler := Middleware("/metrics", next)
 		req := httptest.NewRequest(http.MethodGet, "/test", nil)
 		rec := httptest.NewRecorder()
 
@@ -109,7 +109,7 @@ func TestMiddleware(t *testing.T) {
 			w.WriteHeader(http.StatusNotFound)
 		})
 
-		handler := Middleware(next)
+		handler := Middleware("/metrics", next)
 		req := httptest.NewRequest(http.MethodGet, "/test", nil)
 		rec := httptest.NewRecorder()
 
@@ -126,7 +126,7 @@ func TestMiddleware(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 		})
 
-		handler := Middleware(next)
+		handler := Middleware("/metrics", next)
 		req := httptest.NewRequest(http.MethodGet, "/test", nil)
 		rec := httptest.NewRecorder()
 
@@ -146,7 +146,7 @@ func TestMiddleware(t *testing.T) {
 			nextCalled = true
 		})
 
-		handler := Middleware(next)
+		handler := Middleware("/metrics", next)
 		req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 		rec := httptest.NewRecorder()
 
@@ -163,7 +163,7 @@ func TestMiddleware(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 		})
 
-		handler := Middleware(next)
+		handler := Middleware("/metrics", next)
 		req := httptest.NewRequest(http.MethodGet, "/test", nil)
 		rec := httptest.NewRecorder()
 
@@ -181,7 +181,7 @@ func TestMiddlewareWithDifferentMethods(t *testing.T) {
 				w.WriteHeader(http.StatusOK)
 			})
 
-			handler := Middleware(next)
+			handler := Middleware("/metrics", next)
 			req := httptest.NewRequest(method, "/test", nil)
 			rec := httptest.NewRecorder()
 

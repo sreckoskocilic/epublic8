@@ -15,6 +15,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"epublic8/internal/errors"
 )
 
 // visionObs is one text observation from vision_ocr JSON output.
@@ -54,6 +56,7 @@ func runVisionOCR(ctx context.Context, imgPath, tesseractLang string) visionPage
 	}
 	var res visionPageResult
 	if jsonErr := json.Unmarshal(out, &res); jsonErr != nil {
+		errors.LogWarn("runVisionOCR: failed to parse JSON output for %s: %v", imgPath, jsonErr)
 		return visionPageResult{Text: "", Obs: nil}
 	}
 	return res
@@ -159,9 +162,9 @@ func cropFigures(imgPath string, obs []visionObs, pageNum int) []PDFImage {
 			lines = append(lines, strings.TrimSpace(sorted[k].T))
 		}
 		caption := strings.Join(lines, " ")
-		const maxCaptionLen = 500
-		if len(caption) > maxCaptionLen {
-			caption = caption[:maxCaptionLen]
+		const maxCaptionRunes = 500
+		if runes := []rune(caption); len(runes) > maxCaptionRunes {
+			caption = string(runes[:maxCaptionRunes])
 		}
 		return capMinY, j, caption
 	}

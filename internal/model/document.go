@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"epublic8/internal/errors"
+	"epublic8/internal/metrics"
 	"epublic8/internal/tracing"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -188,6 +189,7 @@ func extractPDFImages(ctx context.Context, pdfPath string, logf func(string, ...
 	// List images first to obtain page numbers and dimensions.
 	listOut, err := exec.CommandContext(ctx, "pdfimages", "-list", pdfPath).Output()
 	if err != nil {
+		logf("pdfimages -list failed: %v", err)
 		return nil
 	}
 	lines := strings.Split(string(listOut), "\n")
@@ -217,17 +219,20 @@ func extractPDFImages(ctx context.Context, pdfPath string, logf func(string, ...
 
 	tmpDir, err := os.MkdirTemp("", "pdf_imgs_*")
 	if err != nil {
+		logf("extractPDFImages: failed to create temp dir: %v", err)
 		return nil
 	}
 	defer os.RemoveAll(tmpDir)
 
 	prefix := filepath.Join(tmpDir, "img")
 	if err := exec.CommandContext(ctx, "pdfimages", "-png", pdfPath, prefix).Run(); err != nil {
+		logf("pdfimages -png failed: %v", err)
 		return nil
 	}
 
 	entries, err := os.ReadDir(tmpDir)
 	if err != nil {
+		logf("extractPDFImages: failed to read temp dir: %v", err)
 		return nil
 	}
 	// Sort entries so their order matches the sequential index from pdfimages.
@@ -287,10 +292,11 @@ func extractPDFImages(ctx context.Context, pdfPath string, logf func(string, ...
 	return images
 }
 
+// ProcessResult holds the output of document processing.
 type ProcessResult struct {
 	ExtractedText string
 	PageCount     int
-	Images        []PDFImage
+	Images        []PDFImage // populated by ProcessDocumentFromPath for PDFs; nil from ProcessDocument
 	ProcessingMs  int64
 	Language      string // BCP-47 language tag derived from OCR language config
 }
@@ -319,9 +325,7 @@ func defaultOCRLanguages() []string {
 }
 
 func NewDocumentProcessor(ocrConcurrencyLimit int, ocrLanguages []string) *DocumentProcessor {
-	// Compile the Vision OCR binary eagerly so the first real request doesn't
-	// pay a 2-10s swiftc compilation penalty.
-	go visionOCROnce.Do(initVisionOCR)
+	// Vision OCR binary is compiled lazily via visionOCROnce in LogToolAvailability.
 	limit := ocrConcurrencyLimit
 	if limit <= 0 {
 		limit = defaultOCRConcurrency()
@@ -734,9 +738,21 @@ func (p *DocumentProcessor) extractPDFTextOCR(ctx context.Context, pdfPath strin
 
 	tmpDir, err := os.MkdirTemp("", "pdf_ocr_*")
 	if err != nil {
+		errors.LogError(err, "extractPDFTextOCR: failed to create temp dir")
 		return "", nil, 0
 	}
 	defer os.RemoveAll(tmpDir)
+
+	// Render all pages in a single pdftoppm call (batch mode) instead of
+	// one process per page. This reduces process spawn overhead significantly
+	// for large PDFs.
+	batchCmd := exec.CommandContext(ctx, "pdftoppm", "-r", "300", "-png",
+		"-f", "1", "-l", strconv.Itoa(pageCount),
+		pdfPath, filepath.Join(tmpDir, "page"))
+	if out, err := batchCmd.CombinedOutput(); err != nil {
+		errors.LogError(err, "extractPDFTextOCR: batch pdftoppm failed: %s", string(out))
+		return "", nil, 0
+	}
 
 	// Create a semaphore for OCR concurrency limiting.
 	ocrSem := make(chan struct{}, p.OCRConcurrencyLimit)
@@ -747,6 +763,10 @@ func (p *DocumentProcessor) extractPDFTextOCR(ctx context.Context, pdfPath strin
 	}
 	results := make([]pageResult, pageCount)
 	var wg sync.WaitGroup
+
+	// pdftoppm zero-pads page numbers based on total page count:
+	// 1-9 pages → 1 digit, 10-99 → 2 digits, 100-999 → 3 digits, etc.
+	padWidth := len(strconv.Itoa(pageCount))
 
 	for i := range pageCount {
 		wg.Add(1)
@@ -759,17 +779,17 @@ func (p *DocumentProcessor) extractPDFTextOCR(ctx context.Context, pdfPath strin
 			}
 			defer func() { <-ocrSem }()
 
-			imgBase := fmt.Sprintf("%s/p%d", tmpDir, page)
-			cmd := exec.CommandContext(ctx, "pdftoppm", "-r", "300", "-png", "-f", strconv.Itoa(page+1), "-l", strconv.Itoa(page+1), "-singlefile", pdfPath, imgBase)
-			if cmd.Run() != nil {
+			imgPath := filepath.Join(tmpDir, fmt.Sprintf("page-%0*d.png", padWidth, page+1))
+			if _, statErr := os.Stat(imgPath); statErr != nil {
+				logf("OCR page %d/%d: rendered image not found", page+1, pageCount)
 				return
 			}
-			imgPath := imgBase + ".png"
-			defer os.Remove(imgPath)
 
 			usedLang := "none"
 			var pageText string
 			var pageFigs []PDFImage
+
+			ocrStart := time.Now()
 
 			// Try Vision first: returns text + bounding boxes for figure detection.
 			for _, lang := range p.OCRLanguages {
@@ -797,6 +817,7 @@ func (p *DocumentProcessor) extractPDFTextOCR(ctx context.Context, pdfPath strin
 				logf("OCR page %d/%d engine=%s", page+1, pageCount, usedLang)
 			}
 
+			metrics.RecordOCRProcessing(time.Since(ocrStart).Seconds())
 			results[page] = pageResult{text: pageText, figs: pageFigs}
 		}(i)
 	}
@@ -1012,7 +1033,8 @@ func NewEPUBGenerator(maxWordsPerChapter int) *EPUBGenerator {
 // GenerateFromText splits text into chapters and distributes images across them
 // proportionally by page number. totalPages is the page count of the source PDF
 // (used to map image.PageNum to a chapter index); pass 0 when no images.
-func (g *EPUBGenerator) GenerateFromText(text string, images []PDFImage, totalPages int, title, author string) (*EPUBResult, error) {
+// language is the BCP-47 tag for the EPUB metadata (e.g. "hr", "en", "sr").
+func (g *EPUBGenerator) GenerateFromText(text string, images []PDFImage, totalPages int, title, author, language string) (*EPUBResult, error) {
 	start := time.Now()
 
 	chapters := g.splitIntoChapters(text)
@@ -1020,10 +1042,14 @@ func (g *EPUBGenerator) GenerateFromText(text string, images []PDFImage, totalPa
 		assignImagesToChapters(chapters, images, totalPages)
 	}
 
+	if language == "" {
+		language = "en"
+	}
+
 	return &EPUBResult{
 		Title:        title,
 		Author:       author,
-		Language:     "en",
+		Language:     language,
 		Chapters:     chapters,
 		ProcessingMs: time.Since(start).Milliseconds(),
 	}, nil
@@ -1047,6 +1073,22 @@ func assignImagesToChapters(chapters []EPUBChapter, images []PDFImage, totalPage
 		}
 		chapters[idx].Images = append(chapters[idx].Images, images[i])
 	}
+}
+
+// isHeadingCandidate performs a cheap pre-check to filter out lines that
+// clearly cannot be chapter headings before running the full regex.
+func isHeadingCandidate(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	r := []rune(s)
+	first := r[0]
+	// Headings start with: uppercase ASCII, uppercase Cyrillic, uppercase Latin extended,
+	// or a digit (for "Chapter 1" patterns).
+	return (first >= 'A' && first <= 'Z') ||
+		(first >= 'А' && first <= 'Я') ||
+		(first >= 0x00C0 && first <= 0x024F) ||
+		(first >= '0' && first <= '9')
 }
 
 // chapterHeadingRe matches chapter heading patterns:
@@ -1075,9 +1117,14 @@ func (g *EPUBGenerator) splitOnHeadings(text string) []EPUBChapter {
 	var currentTitle string
 	var currentContent strings.Builder
 
+	// Pre-allocate content builder with a reasonable estimate.
+	currentContent.Grow(len(text) / 4)
+
 	for _, line := range strings.Split(text, "\n") {
 		trimmed := strings.TrimSpace(line)
-		if chapterHeadingRe.MatchString(trimmed) {
+		// Cheap pre-check: skip lines that are too long or too short to be headings,
+		// or that don't start with an uppercase letter or digit.
+		if len(trimmed) > 0 && len(trimmed) <= 80 && isHeadingCandidate(trimmed) && chapterHeadingRe.MatchString(trimmed) {
 			if currentContent.Len() > 0 {
 				title := currentTitle
 				if title == "" {
@@ -1116,12 +1163,9 @@ func (g *EPUBGenerator) splitByWordCount(text string) []EPUBChapter {
 	var chapters []EPUBChapter
 	paragraphs := strings.Split(text, "\n\n")
 	var current strings.Builder
+	current.Grow(g.MaxWordsPerChapter * 6) // ~6 bytes per word average
 	chapterCount := 1
 	wordCount := 0
-	maxWordsPerChapter := g.MaxWordsPerChapter
-	if maxWordsPerChapter <= 0 {
-		maxWordsPerChapter = 1500
-	}
 
 	for _, para := range paragraphs {
 		para = strings.TrimSpace(para)
@@ -1131,7 +1175,7 @@ func (g *EPUBGenerator) splitByWordCount(text string) []EPUBChapter {
 		current.WriteString(para)
 		current.WriteString("\n\n")
 		wordCount += len(strings.Fields(para))
-		if wordCount >= maxWordsPerChapter {
+		if wordCount >= g.MaxWordsPerChapter {
 			chapters = append(chapters, EPUBChapter{
 				Title:   strconv.Itoa(chapterCount),
 				Content: strings.TrimSpace(current.String()),

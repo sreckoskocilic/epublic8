@@ -29,7 +29,7 @@ var (
 		prometheus.HistogramOpts{
 			Name:                            "http_request_duration_seconds",
 			Help:                            "HTTP request duration in seconds",
-			Buckets:                         []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
+			Buckets:                         []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300},
 			Namespace:                       "",
 			Subsystem:                       "",
 			ConstLabels:                     nil,
@@ -88,6 +88,25 @@ var (
 			ConstLabels: nil,
 		},
 	)
+
+	// OCRProcessingDuration is a histogram for OCR processing time in seconds.
+	OCRProcessingDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:                            "ocr_processing_duration_seconds",
+			Help:                            "OCR processing duration in seconds",
+			Buckets:                         []float64{0.5, 1, 2.5, 5, 10, 30, 60, 120, 300},
+			Namespace:                       "",
+			Subsystem:                       "",
+			ConstLabels:                     nil,
+			NativeHistogramBucketFactor:     0,
+			NativeHistogramZeroThreshold:    0,
+			NativeHistogramMaxBucketNumber:  0,
+			NativeHistogramMinResetDuration: 0,
+			NativeHistogramMaxZeroThreshold: 0,
+			NativeHistogramMaxExemplars:     0,
+			NativeHistogramExemplarTTL:      0,
+		},
+	)
 )
 
 // RecordRequest increments the request counter and records duration.
@@ -109,6 +128,11 @@ func RecordDocumentProcessed(success bool) {
 // RecordOCRCall increments the OCR call counter.
 func RecordOCRCall() {
 	OCRCallsTotal.Inc()
+}
+
+// RecordOCRProcessing records OCR processing duration in seconds.
+func RecordOCRProcessing(duration float64) {
+	OCRProcessingDuration.Observe(duration)
 }
 
 // IncActiveRequests increments the active requests gauge.
@@ -149,10 +173,14 @@ func statusToString(status int) string {
 }
 
 // Middleware returns an HTTP middleware that records metrics for each request.
-func Middleware(next http.Handler) http.Handler {
+// The metricsPath parameter specifies the URL path to skip (to avoid infinite recursion).
+func Middleware(metricsPath string, next http.Handler) http.Handler {
+	if metricsPath == "" {
+		metricsPath = "/metrics"
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Skip metrics endpoint to avoid infinite recursion
-		if r.URL.Path == "/metrics" {
+		if r.URL.Path == metricsPath {
 			next.ServeHTTP(w, r)
 			return
 		}
