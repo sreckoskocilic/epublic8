@@ -19,7 +19,9 @@ jobs:
           go-version-file: go.mod
 
       - name: Run tests
-        run: go test ./...
+        run: |
+          apt-get install poppler-utils tesseract-ocr
+          go test ./...
 
       - name: Install golangci-lint
         run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
