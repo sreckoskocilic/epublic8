@@ -20,7 +20,7 @@ jobs:
 
       - name: Run tests
         run: |
-          apt-get install poppler-utils tesseract-ocr
+          sudo apt-get install poppler-utils tesseract-ocr
           go test ./...
 
       - name: Install golangci-lint
