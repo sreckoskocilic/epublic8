@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"epublic8/internal/config"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // BasicAuth returns a handler that wraps the provided handler with basic authentication.
@@ -76,12 +77,15 @@ func BasicAuth(cfg *config.SecurityConfig, next http.Handler) http.Handler {
 			return
 		}
 
-		// For plain passwords, compare directly
-		// For bcrypt hashes (starts with $2), we compare the hash of the provided password
-		// But since we don't have the original password, we do a simple comparison
-		// Note: In production, you'd want to use bcrypt.CompareHashAndPassword
-		// For now, we support plain text password comparison
-		if subtle.ConstantTimeCompare([]byte(passwordOrHash), []byte(providedPass)) != 1 {
+		// For bcrypt hashes (starts with $2a$, $2b$, or $2y$), use bcrypt comparison.
+		// For plain text passwords, use constant-time comparison.
+		var passwordOK bool
+		if strings.HasPrefix(passwordOrHash, "$2a$") || strings.HasPrefix(passwordOrHash, "$2b$") || strings.HasPrefix(passwordOrHash, "$2y$") {
+			passwordOK = bcrypt.CompareHashAndPassword([]byte(passwordOrHash), []byte(providedPass)) == nil
+		} else {
+			passwordOK = subtle.ConstantTimeCompare([]byte(passwordOrHash), []byte(providedPass)) == 1
+		}
+		if !passwordOK {
 			w.Header().Set("WWW-Authenticate", `Basic realm="restricted"`)
 			http.Error(w, "invalid credentials", http.StatusUnauthorized)
 			return

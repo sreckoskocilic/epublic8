@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -23,6 +25,18 @@ import (
 const pidFile = "document-service.pid"
 
 func writePID() {
+	// Remove a stale PID file from a previous crash before writing a new one.
+	if data, err := os.ReadFile(pidFile); err == nil {
+		if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil {
+			if proc, err := os.FindProcess(pid); err == nil {
+				// Signal 0 checks existence without sending a real signal.
+				if proc.Signal(syscall.Signal(0)) != nil {
+					log.Printf("removing stale PID file (pid %d no longer running)", pid)
+					os.Remove(pidFile)
+				}
+			}
+		}
+	}
 	if err := os.WriteFile(pidFile, []byte(fmt.Sprintf("%d", os.Getpid())), 0600); err != nil {
 		log.Printf("warning: could not write PID file: %v", err)
 	}
@@ -95,6 +109,7 @@ func main() {
 		Addr:              ":" + cfg.Server.HTTPPort,
 		Handler:           metrics.Middleware(http.HandlerFunc(webHandler.ServeHTTP)),
 		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 	go func() {
 		log.Printf("HTTP server listening on :%s", cfg.Server.HTTPPort)
@@ -136,6 +151,12 @@ func main() {
 // cleanupLoop deletes EPUBs older than retentionHours from
 // dir, running every intervalHours. Exits on ctx cancel.
 func cleanupLoop(ctx context.Context, dir string, retentionHours, intervalHours int) {
+	if retentionHours <= 0 {
+		retentionHours = 24
+	}
+	if intervalHours <= 0 {
+		intervalHours = 1
+	}
 	retention := time.Duration(retentionHours) * time.Hour
 	interval := time.Duration(intervalHours) * time.Hour
 	ticker := time.NewTicker(interval)
@@ -153,6 +174,9 @@ func cleanupLoop(ctx context.Context, dir string, retentionHours, intervalHours 
 		}
 		cutoff := time.Now().Add(-retention)
 		for _, e := range entries {
+			if e.IsDir() || filepath.Ext(e.Name()) != ".epub" {
+				continue
+			}
 			info, err := e.Info()
 			if err != nil {
 				log.Printf("cleanup: failed to stat %s: %v", e.Name(), err)

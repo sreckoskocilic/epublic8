@@ -290,7 +290,11 @@
                         Advanced
                     </div>
                     <div class="advanced-body" id="advancedBody">
-                        <label class="option-row">
+                        <label class="option-row" style="flex-direction:column;align-items:flex-start;gap:4px">
+                            <span>Author <span class="option-hint">&mdash; written to EPUB metadata</span></span>
+                            <input type="text" id="author" name="author" placeholder="Unknown Author" maxlength="200" style="width:100%;padding:4px 8px;border:1px solid #444;border-radius:4px;background:#1a1a1a;color:#e0e0e0;font-size:13px">
+                        </label>
+                        <label class="option-row" style="margin-top:8px">
                             <input type="checkbox" id="smartOcr" name="smart_ocr" value="true" checked>
                             <span>Smart OCR <span class="option-hint">&mdash; detect garbled fonts and scan-based PDFs; re-render with OCR for cleaner text</span></span>
                         </label>
@@ -452,6 +456,7 @@
 
             const formData = new FormData();
             formData.append('file', fileInput.files[0]);
+            formData.append('author', document.getElementById('author').value.trim());
             formData.append('smart_ocr', smartOcrEl.checked ? 'true' : 'false');
             formData.append('force_ocr', document.getElementById('forceOcr').checked ? 'true' : 'false');
             formData.append('strip_headers', document.getElementById('stripHeaders').checked ? 'true' : 'false');
@@ -476,6 +481,11 @@
                     body: formData,
                     signal: abortController.signal,
                 });
+                if (!response.ok) {
+                    const text = await response.text();
+                    showResult('error', `Server error (${response.status}): ${text.trim() || 'Upload failed'}`);
+                    return;
+                }
                 const reader  = response.body.getReader();
                 const decoder = new TextDecoder();
                 let buf = '', finished = false;

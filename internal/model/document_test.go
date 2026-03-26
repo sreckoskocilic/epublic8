@@ -429,7 +429,7 @@ func TestGenerateFromTextEmpty(t *testing.T) {
 
 func TestNewDocumentProcessorAndProcess(t *testing.T) {
 	p := NewDocumentProcessor(0, nil)
-	result, err := p.ProcessDocument(context.Background(), []byte("Hello world"), "text/plain", func(string, ...any) {})
+	result, err := p.ProcessDocument(context.Background(), []byte("Hello world"), "text/plain", DefaultProcessOptions(), func(string, ...any) {})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

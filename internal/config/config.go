@@ -216,7 +216,15 @@ func applyEnvOverrides(cfg *Config) error {
 		}
 	}
 	if v := os.Getenv("OCR_LANGUAGES"); v != "" {
-		cfg.OCR.Languages = strings.Split(v, ",")
+		var langs []string
+		for _, lang := range strings.Split(v, ",") {
+			if lang = strings.TrimSpace(lang); lang != "" {
+				langs = append(langs, lang)
+			}
+		}
+		if len(langs) > 0 {
+			cfg.OCR.Languages = langs
+		}
 	}
 
 	// EPUB config

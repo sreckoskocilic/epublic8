@@ -37,8 +37,10 @@ var entityPatterns = map[string][]*regexp.Regexp{
 		regexp.MustCompile(`\b(?:United States|United Kingdom|Canada|Australia|Germany|France|Japan|China|India|Brazil|Mexico|Spain|Italy|Russia|Korea)\b`),
 	},
 	"ORGANIZATION": {
-		// Common company suffixes (optional periods)
-		regexp.MustCompile(`\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*\s+(?:Inc\.?|Corp\.?|LLC|Ltd\.?|Co\.?|Company|Corporation|Group|International|Technologies|Solutions|Services|Labs?)\b`),
+		// Common company suffixes (optional periods) - handles Inc, Corp, LLC, Ltd
+		regexp.MustCompile(`\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,5}\s+(?:Inc\.?|Corp\.?|LLC|Ltd\.?|Co\.?|Company|Corporation|Group|International|Technologies|Solutions|Services|Labs?)\b`),
+		// All-caps suffixes like LLC, LTD
+		regexp.MustCompile(`\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,5}\s+[A-Z]{2,}\b`),
 		// Acronyms followed by common words
 		regexp.MustCompile(`\b[A-Z]{2,}\s+(?:University|College|Institute|Foundation|Association|Organization)\b`),
 	},
@@ -88,7 +90,11 @@ func (h *DocumentHandler) ProcessDocument(ctx context.Context, req *pb.DocumentR
 	h.incrementRequests()
 	defer h.decrementRequests()
 
-	result, err := h.Processor.ProcessDocument(ctx, req.Content, req.MimeType, log.Printf)
+	opts := model.DefaultProcessOptions()
+	if req.Options != nil {
+		opts.ForceOCR = req.Options.EnableOcr
+	}
+	result, err := h.Processor.ProcessDocument(ctx, req.Content, req.MimeType, opts, log.Printf)
 	if err != nil {
 		tracing.AddSpanError(ctx, err)
 		return nil, status.Errorf(codes.Internal, "failed to process document: %v", err)
@@ -98,7 +104,7 @@ func (h *DocumentHandler) ProcessDocument(ctx context.Context, req *pb.DocumentR
 		ExtractedText: result.ExtractedText,
 		Metadata: &pb.DocumentMetadata{
 			PageCount:        int32(result.PageCount),
-			DetectedLanguage: "en",
+			DetectedLanguage: result.Language,
 			DocumentType:     req.MimeType,
 		},
 		Stats: &pb.ProcessingStats{
@@ -116,6 +122,8 @@ func (h *DocumentHandler) StreamProcessDocument(stream pb.DocumentService_Stream
 	defer h.decrementRequests()
 
 	var documentID string
+	var mimeType string
+	var chunkOptions *pb.ProcessOptions
 	var buf bytes.Buffer
 	var totalChunks int32
 	chunksReceived := 0
@@ -132,6 +140,12 @@ func (h *DocumentHandler) StreamProcessDocument(stream pb.DocumentService_Stream
 
 		documentID = chunk.DocumentId
 		totalChunks = chunk.TotalChunks
+		if mimeType == "" && chunk.MimeType != "" {
+			mimeType = chunk.MimeType
+		}
+		if chunkOptions == nil && chunk.Options != nil {
+			chunkOptions = chunk.Options
+		}
 		buf.Write(chunk.Content)
 		chunksReceived++
 	}
@@ -145,17 +159,25 @@ func (h *DocumentHandler) StreamProcessDocument(stream pb.DocumentService_Stream
 
 	span.SetAttributes(attribute.Int("stream.chunks_received", chunksReceived))
 
-	result, err := h.Processor.ProcessDocument(ctx, buf.Bytes(), "application/octet-stream", log.Printf)
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+	streamOpts := model.DefaultProcessOptions()
+	if chunkOptions != nil {
+		streamOpts.ForceOCR = chunkOptions.EnableOcr
+	}
+	result, err := h.Processor.ProcessDocument(ctx, buf.Bytes(), mimeType, streamOpts, log.Printf)
 	if err != nil {
 		tracing.AddSpanError(ctx, err)
 		return status.Errorf(codes.Internal, "failed to process document: %v", err)
 	}
 
 	return stream.Send(&pb.DocumentChunkResponse{
-		DocumentId:      documentID,
-		ExtractedText:   result.ExtractedText,
-		ProcessedChunks: totalChunks,
-		IsFinal:         true,
+		DocumentId:       documentID,
+		ExtractedText:    result.ExtractedText,
+		ProcessedChunks:  totalChunks,
+		IsFinal:          true,
+		DetectedLanguage: result.Language,
 		Stats: &pb.ProcessingStats{
 			ProcessingTimeMs: result.ProcessingMs,
 		},
@@ -187,6 +209,11 @@ func (h *DocumentHandler) ExtractEntities(ctx context.Context, req *pb.EntityReq
 			DocumentId: req.DocumentId,
 			Entities:   []*pb.Entity{},
 		}, nil
+	}
+
+	const maxTextBytes = 1 << 20 // 1 MB limit for regex matching
+	if len(req.Text) > maxTextBytes {
+		return nil, status.Errorf(codes.InvalidArgument, "text too large for entity extraction (max 1 MB)")
 	}
 
 	// Determine which entity types to extract

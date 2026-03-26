@@ -297,13 +297,14 @@ func TestHandleDownloadPathTraversalEncoded(t *testing.T) {
 
 func TestHandleDownloadPathTraversalDoubleEncoded(t *testing.T) {
 	h := newTestWebHandler(t)
-	// Attempt with double-encoded ".."
+	// After one URL decode, %252e%252e becomes %2e%2e/secret.epub.
+	// filepath.Base strips the directory component, leaving "secret.epub".
+	// No traversal is possible; the file simply doesn't exist → 404.
 	req := httptest.NewRequest(http.MethodGet, "/download?file=%252e%252e/secret.epub", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	// Double-encoded stays as %2e%2e after single decode, filepath.Base keeps it
-	if rec.Code != http.StatusBadRequest {
-		t.Errorf("expected 400 for double-encoded path traversal attempt, got %d", rec.Code)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for double-encoded path (safe, file absent), got %d", rec.Code)
 	}
 }
 

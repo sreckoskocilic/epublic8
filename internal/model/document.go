@@ -83,11 +83,12 @@ func initVisionOCR() {
 	binFile.Close()
 	os.Remove(binPath) // swiftc will create it
 
-	cmd := exec.Command(swiftc, "-O", src, "-o", binPath)
+	compileCtx, compileCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer compileCancel()
+	cmd := exec.CommandContext(compileCtx, swiftc, "-O", src, "-o", binPath)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		// Log compilation failure at DEBUG level - this is optional functionality
-		// and Tesseract is always available as a fallback.
-		errors.LogDebug("Vision OCR compilation failed: %s (using Tesseract fallback)", string(out))
+		// Log compilation failure at WARN level - Tesseract remains the fallback.
+		errors.LogWarn("Vision OCR compilation failed: %s (using Tesseract fallback)", string(out))
 		os.Remove(binPath)
 		return
 	}
@@ -291,6 +292,25 @@ type ProcessResult struct {
 	PageCount     int
 	Images        []PDFImage
 	ProcessingMs  int64
+	Language      string // BCP-47 language tag derived from OCR language config
+}
+
+// ocrLangToBCP47 converts a Tesseract language code to a BCP-47 tag.
+func ocrLangToBCP47(lang string) string {
+	// Combined codes like "srp_latn+hrv" → use first part.
+	if idx := strings.Index(lang, "+"); idx >= 0 {
+		lang = lang[:idx]
+	}
+	switch lang {
+	case "srp_latn", "hrv":
+		return "hr"
+	case "srp":
+		return "sr"
+	case "eng":
+		return "en"
+	default:
+		return "und"
+	}
 }
 
 // defaultOCRLanguages returns the default OCR languages if none specified.
@@ -316,7 +336,7 @@ func NewDocumentProcessor(ocrConcurrencyLimit int, ocrLanguages []string) *Docum
 	}
 }
 
-func (p *DocumentProcessor) ProcessDocument(ctx context.Context, content []byte, mimeType string, logf func(string, ...any)) (*ProcessResult, error) {
+func (p *DocumentProcessor) ProcessDocument(ctx context.Context, content []byte, mimeType string, opts ProcessOptions, logf func(string, ...any)) (*ProcessResult, error) {
 	ctx, span := tracing.StartSpan(ctx, "ProcessDocument",
 		trace.WithAttributes(
 			attribute.String("document.mime_type", mimeType),
@@ -326,9 +346,14 @@ func (p *DocumentProcessor) ProcessDocument(ctx context.Context, content []byte,
 	defer span.End()
 
 	start := time.Now()
+	lang := "und"
+	if len(p.OCRLanguages) > 0 {
+		lang = ocrLangToBCP47(p.OCRLanguages[0])
+	}
 	result := &ProcessResult{
-		ExtractedText: p.extractText(ctx, content, mimeType, logf),
+		ExtractedText: p.extractText(ctx, content, mimeType, opts, logf),
 		PageCount:     1,
+		Language:      lang,
 		ProcessingMs:  time.Since(start).Milliseconds(),
 		Images:        nil,
 	}
@@ -339,10 +364,10 @@ func (p *DocumentProcessor) ProcessDocument(ctx context.Context, content []byte,
 	return result, nil
 }
 
-func (p *DocumentProcessor) extractText(ctx context.Context, content []byte, mimeType string, logf func(string, ...any)) string {
+func (p *DocumentProcessor) extractText(ctx context.Context, content []byte, mimeType string, opts ProcessOptions, logf func(string, ...any)) string {
 	switch mimeType {
 	case "application/pdf":
-		return p.extractPDFText(ctx, content, logf)
+		return p.extractPDFText(ctx, content, opts, logf)
 	case "image/png", "image/jpeg", "image/tiff":
 		return p.extractImageText(ctx, content, logf)
 	case "text/plain", "text/markdown", "text/html", "application/octet-stream":
@@ -401,13 +426,14 @@ func runTesseractOCR(ctx context.Context, imgPath string, langs []string, logf f
 	return "", ""
 }
 
-func (p *DocumentProcessor) extractPDFText(ctx context.Context, content []byte, logf func(string, ...any)) string {
+func (p *DocumentProcessor) extractPDFText(ctx context.Context, content []byte, opts ProcessOptions, logf func(string, ...any)) string {
 	path, err := writeTempFile("pdf_*.pdf", content, logf)
 	if err != nil {
-		return fmt.Sprintf("[PDF Error: %v]", err)
+		errors.LogWarn("extractPDFText: failed to write temp file: %v", err)
+		return "[PDF Error: failed to write temporary file]"
 	}
 	defer os.Remove(path)
-	text, _, _ := p.extractPDFTextFromPath(ctx, path, DefaultProcessOptions(), logf)
+	text, _, _ := p.extractPDFTextFromPath(ctx, path, opts, logf)
 	return text
 }
 
@@ -416,7 +442,8 @@ func (p *DocumentProcessor) extractPDFText(ctx context.Context, content []byte, 
 func (p *DocumentProcessor) extractImageText(ctx context.Context, content []byte, logf func(string, ...any)) string {
 	path, err := writeTempFile("img_ocr_*", content, logf)
 	if err != nil {
-		return fmt.Sprintf("[Image OCR Error: %v]", err)
+		errors.LogWarn("extractImageText: failed to write temp file: %v", err)
+		return "[Image OCR Error: failed to write temporary file]"
 	}
 	defer os.Remove(path)
 
@@ -606,12 +633,17 @@ func (p *DocumentProcessor) ProcessDocumentFromPath(ctx context.Context, filePat
 		if err != nil {
 			return nil, fmt.Errorf("read file: %w", err)
 		}
-		extractedText = p.extractText(ctx, content, mimeType, logf)
+		extractedText = p.extractText(ctx, content, mimeType, opts, logf)
+	}
+	lang := "und"
+	if len(p.OCRLanguages) > 0 {
+		lang = ocrLangToBCP47(p.OCRLanguages[0])
 	}
 	result := &ProcessResult{
 		ExtractedText: extractedText,
 		PageCount:     pageCount,
 		Images:        images,
+		Language:      lang,
 		ProcessingMs:  time.Since(start).Milliseconds(),
 	}
 	span.SetAttributes(
@@ -720,7 +752,11 @@ func (p *DocumentProcessor) extractPDFTextOCR(ctx context.Context, pdfPath strin
 		wg.Add(1)
 		go func(page int) {
 			defer wg.Done()
-			ocrSem <- struct{}{}
+			select {
+			case ocrSem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
 			defer func() { <-ocrSem }()
 
 			imgBase := fmt.Sprintf("%s/p%d", tmpDir, page)
@@ -933,11 +969,17 @@ func (p *DocumentProcessor) processPageFootnotes(text string) string {
 }
 
 func (p *DocumentProcessor) Close() error {
+	if visionOCRBin != "" {
+		os.Remove(visionOCRBin)
+	}
 	return nil
 }
 
+// IsLoaded returns true when the required processing tools are available.
 func (p *DocumentProcessor) IsLoaded() bool {
-	return true
+	_, pdfErr := exec.LookPath("pdftotext")
+	_, tessErr := exec.LookPath("tesseract")
+	return pdfErr == nil || tessErr == nil
 }
 
 type EPUBGenerator struct {

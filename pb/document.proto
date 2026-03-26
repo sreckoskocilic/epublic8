@@ -40,6 +40,7 @@ message DocumentChunk {
   int32 chunk_index = 3;
   int32 total_chunks = 4;
   ProcessOptions options = 5;
+  string mime_type = 6; // optional; set on first chunk to declare document type
 }
 
 message DocumentChunkResponse {
@@ -48,6 +49,7 @@ message DocumentChunkResponse {
   int32 processed_chunks = 3;
   bool is_final = 4;
   ProcessingStats stats = 5;
+  string detected_language = 6;
 }
 
 message EntityRequest {

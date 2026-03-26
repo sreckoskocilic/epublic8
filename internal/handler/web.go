@@ -11,6 +11,7 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,6 +21,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/time/rate"
 
 	"epublic8/internal/config"
 	"epublic8/internal/errors"
@@ -39,6 +42,9 @@ var (
 	BuildTime = "unknown"
 )
 
+// uploadBurst is the per-IP burst size for upload rate limiting (10 per minute).
+const uploadBurst = 10
+
 type WebHandler struct {
 	documentHandler *DocumentHandler
 	epubGenerator   *model.EPUBGenerator
@@ -47,6 +53,9 @@ type WebHandler struct {
 	templates       *template.Template
 	securityCfg     config.SecurityConfig
 	metricsCfg      config.MetricsConfig
+	uploadLimiters  sync.Map      // map[string]*rate.Limiter, keyed by remote IP
+	limiterStopCh   chan struct{} // closed by Close() to stop the pruning goroutine
+	authHandler     http.Handler  // pre-built auth-wrapped handler; nil if no auth configured
 }
 
 //go:embed templates
@@ -90,7 +99,7 @@ func NewWebHandler(docHandler *DocumentHandler, outputDir string, securityCfg co
 
 	epubGen := model.NewEPUBGenerator(chapterWords)
 
-	return &WebHandler{
+	h := &WebHandler{
 		documentHandler: docHandler,
 		epubGenerator:   epubGen,
 		uploadDir:       outputDir,
@@ -98,7 +107,36 @@ func NewWebHandler(docHandler *DocumentHandler, outputDir string, securityCfg co
 		persistentDir:   persistent,
 		securityCfg:     securityCfg,
 		metricsCfg:      metricsCfg,
-	}, nil
+		uploadLimiters:  sync.Map{},
+		limiterStopCh:   make(chan struct{}),
+		authHandler:     nil,
+	}
+	if securityCfg.BasicAuth != "" {
+		h.authHandler = middleware.BasicAuth(&h.securityCfg, http.HandlerFunc(h.servePath))
+	}
+	go h.pruneLimiters()
+	return h, nil
+}
+
+// pruneLimiters periodically removes idle per-IP rate limiters to prevent
+// unbounded memory growth on servers that receive requests from many IPs.
+func (h *WebHandler) pruneLimiters() {
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-h.limiterStopCh:
+			return
+		case <-ticker.C:
+			h.uploadLimiters.Range(func(k, v any) bool {
+				// Bucket is full → no uploads from this IP in a while → prune.
+				if v.(*rate.Limiter).Tokens() >= uploadBurst {
+					h.uploadLimiters.Delete(k)
+				}
+				return true
+			})
+		}
+	}
 }
 
 func (h *WebHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -112,10 +150,8 @@ func (h *WebHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	isProtected := protectedPaths[path]
 
 	// Apply auth middleware if this is a protected endpoint
-	if isProtected && h.securityCfg.BasicAuth != "" {
-		// Create a basic auth wrapper for this specific handler
-		authHandler := middleware.BasicAuth(&h.securityCfg, http.HandlerFunc(h.servePath))
-		authHandler.ServeHTTP(w, r)
+	if isProtected && h.authHandler != nil {
+		h.authHandler.ServeHTTP(w, r)
 		return
 	}
 
@@ -235,6 +271,20 @@ func (h *WebHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Per-IP rate limit: uploadBurst uploads per minute.
+	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if ip == "" {
+		ip = r.RemoteAddr // fallback if parsing fails
+	}
+	limiterVal, ok := h.uploadLimiters.Load(ip)
+	if !ok {
+		limiterVal, _ = h.uploadLimiters.LoadOrStore(ip, rate.NewLimiter(rate.Every(6*time.Second), uploadBurst))
+	}
+	if !limiterVal.(*rate.Limiter).Allow() {
+		http.Error(w, "Too many requests", http.StatusTooManyRequests)
+		return
+	}
+
 	r.Body = http.MaxBytesReader(w, r.Body, 200<<20) // 200 MB limit
 
 	flusher, ok := w.(http.Flusher)
@@ -260,7 +310,8 @@ func (h *WebHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 	// http.ResponseWriter is not goroutine-safe.
 	var sseMu sync.Mutex
 	sendEvent := func(typ, payload string) {
-		// Escape newlines so SSE frame boundaries (\n\n) are never broken.
+		// Escape newlines/carriage-returns so SSE frame boundaries (\n\n) are never broken.
+		payload = strings.ReplaceAll(payload, "\r", " ")
 		payload = strings.ReplaceAll(payload, "\n", " ")
 		sseMu.Lock()
 		defer sseMu.Unlock()
@@ -313,6 +364,10 @@ func (h *WebHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 			".html": "text/html",
 		}[ext]
 	}
+	if mimeType == "" {
+		sendEvent("error", fmt.Sprintf("unsupported file type %q — accepted: .pdf, .txt, .md, .html", filepath.Ext(header.Filename)))
+		return
+	}
 
 	// Process with a 10-minute timeout.
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
@@ -347,6 +402,11 @@ func (h *WebHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 	goroutineTookOwnership = true
 	go func() {
 		defer os.Remove(uploadPath)
+		defer func() {
+			if r := recover(); r != nil {
+				resCh <- procResult{nil, fmt.Errorf("internal error: %v", r)}
+			}
+		}()
 		doc, err := h.documentHandler.Processor.ProcessDocumentFromPath(ctx, uploadPath, mimeType, opts, logf)
 		resCh <- procResult{doc, err}
 	}()
@@ -367,8 +427,15 @@ func (h *WebHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	logf("Extracted %d chars in %dms", len(docResult.ExtractedText), docResult.ProcessingMs)
 
-	title := strings.TrimSuffix(header.Filename, filepath.Ext(header.Filename))
-	epubResult, err := h.epubGenerator.GenerateFromText(docResult.ExtractedText, docResult.Images, docResult.PageCount, title, "Document Author")
+	base := filepath.Base(header.Filename)
+	title := strings.TrimSuffix(base, filepath.Ext(base))
+	author := r.FormValue("author")
+	if author == "" {
+		author = "Unknown Author"
+	} else if len([]rune(author)) > 200 {
+		author = string([]rune(author)[:200])
+	}
+	epubResult, err := h.epubGenerator.GenerateFromText(docResult.ExtractedText, docResult.Images, docResult.PageCount, title, author)
 	if err != nil {
 		logf("EPUB generation error: %v", err)
 		sendEvent("error", err.Error())
@@ -386,7 +453,9 @@ func (h *WebHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 	epubPath := filepath.Join(h.uploadDir, filename)
 	if err := h.generateEPUBFile(epubResult, epubPath); err != nil {
 		logf("EPUB file error: %v", err)
-		os.Remove(epubPath)
+		if removeErr := os.Remove(epubPath); removeErr != nil && !os.IsNotExist(removeErr) {
+			errors.LogWarn("failed to remove partial EPUB %s: %v", epubPath, removeErr)
+		}
 		sendEvent("error", err.Error())
 		return
 	}
@@ -486,53 +555,49 @@ func (h *WebHandler) handleDownload(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, safeName, fi.ModTime(), f)
 }
 
-// validateDownloadPath performs comprehensive path traversal protection.
+// validateDownloadPath performs path traversal protection.
 // It returns the validated absolute path or an error if the path is invalid.
 func (h *WebHandler) validateDownloadPath(filename string) (string, error) {
-	// Step 0: Check for path traversal attempts and absolute paths in the original filename
-	// This catches both raw ".." and URL-encoded "%2e%2e" (which becomes ".." after HTTP decoding)
-	// Also rejects absolute paths which could bypass Base() checks
-	if strings.Contains(filename, "..") || strings.Contains(filename, "%2e%2e") || filepath.IsAbs(filename) {
+	// Reject obvious traversal attempts before any further processing.
+	if strings.Contains(filename, "..") || filepath.IsAbs(filename) {
 		return "", fmt.Errorf("invalid file")
 	}
 
-	// Step 1: Strip directory components using filepath.Base
+	// Strip directory components; only the base name is used.
 	safeName := filepath.Base(filename)
 
-	// Step 2: Explicit check for ".." sequences (defense in depth)
-	// This catches attempts like "../etc/passwd" or "foo/../../bar"
-	if strings.Contains(safeName, "..") {
-		return "", fmt.Errorf("invalid file")
-	}
-
-	// Step 3: Verify extension is .epub only
+	// Only .epub files are served.
 	if filepath.Ext(safeName) != ".epub" {
 		return "", fmt.Errorf("invalid file")
 	}
 
-	// Step 4: Build the full path
-	filePath := filepath.Join(h.uploadDir, safeName)
-
-	// Step 5: Canonicalize the path to resolve any symlinks or relative components
-	// filepath.Clean normalizes the path (removes redundant separators, etc.)
-	cleanPath := filepath.Clean(filePath)
-
-	// Step 6: Canonicalize the base directory for comparison
+	// Build and clean the full path, then verify it stays within uploadDir.
+	cleanPath := filepath.Clean(filepath.Join(h.uploadDir, safeName))
 	cleanBase := filepath.Clean(h.uploadDir)
-
-	// Step 7: Verify the resolved path is within the allowed directory
-	// Use explicit prefix check with trailing separator to prevent partial matches
-	// e.g., "/uploads/evil" should not match prefix "/uploads/ev"
 	if !strings.HasPrefix(cleanPath+string(filepath.Separator), cleanBase+string(filepath.Separator)) {
 		return "", fmt.Errorf("invalid file")
 	}
 
-	// Step 8: Additional check - ensure the final path doesn't contain ".." after cleaning
-	if strings.Contains(cleanPath, "..") {
+	// Resolve symlinks so a symlink pointing outside uploadDir can't be served.
+	// Both the file path and the base dir must be resolved for the comparison to
+	// be meaningful (e.g., /tmp is a symlink to /private/tmp on macOS).
+	resolvedBase, err := filepath.EvalSymlinks(cleanBase)
+	if err != nil {
+		resolvedBase = cleanBase
+	}
+	resolvedPath, err := filepath.EvalSymlinks(cleanPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// File doesn't exist; let os.Open produce the 404.
+			return cleanPath, nil
+		}
+		return "", fmt.Errorf("invalid file")
+	}
+	if !strings.HasPrefix(resolvedPath+string(filepath.Separator), resolvedBase+string(filepath.Separator)) {
 		return "", fmt.Errorf("invalid file")
 	}
 
-	return cleanPath, nil
+	return resolvedPath, nil
 }
 
 // epubZip wraps zip.Writer and propagates the first write error so callers
@@ -912,6 +977,7 @@ func isUpperStart(r rune) bool {
 }
 
 func (h *WebHandler) Close() error {
+	close(h.limiterStopCh)
 	if !h.persistentDir {
 		os.RemoveAll(h.uploadDir)
 	}
