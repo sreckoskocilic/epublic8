@@ -775,6 +775,7 @@ func (p *DocumentProcessor) extractPDFTextOCR(ctx context.Context, pdfPath strin
 			select {
 			case ocrSem <- struct{}{}:
 			case <-ctx.Done():
+				logf("OCR page %d/%d: cancelled (%v)", page+1, pageCount, ctx.Err())
 				return
 			}
 			defer func() { <-ocrSem }()
@@ -817,6 +818,7 @@ func (p *DocumentProcessor) extractPDFTextOCR(ctx context.Context, pdfPath strin
 				logf("OCR page %d/%d engine=%s", page+1, pageCount, usedLang)
 			}
 
+			metrics.RecordOCRCall()
 			metrics.RecordOCRProcessing(time.Since(ocrStart).Seconds())
 			results[page] = pageResult{text: pageText, figs: pageFigs}
 		}(i)
@@ -1194,8 +1196,4 @@ func (g *EPUBGenerator) splitByWordCount(text string) []EPUBChapter {
 		})
 	}
 	return chapters
-}
-
-func (g *EPUBGenerator) Close() error {
-	return nil
 }

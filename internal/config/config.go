@@ -293,8 +293,13 @@ func applyEnvOverrides(cfg *Config) error {
 
 // String returns a YAML representation of the config (without sensitive values).
 func (c *Config) String() string {
-	// Create a copy for display (hide sensitive data)
+	// Create a copy for display (hide sensitive data).
+	// AllowedHosts is explicitly copied so the display path cannot mutate the original slice.
 	displayCfg := *c
+	if len(c.Security.AllowedHosts) > 0 {
+		displayCfg.Security.AllowedHosts = make([]string, len(c.Security.AllowedHosts))
+		copy(displayCfg.Security.AllowedHosts, c.Security.AllowedHosts)
+	}
 	if displayCfg.Security.BasicAuth != "" {
 		displayCfg.Security.BasicAuth = "***"
 	}

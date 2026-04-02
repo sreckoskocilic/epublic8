@@ -3,12 +3,22 @@ package tracing
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	"epublic8/internal/config"
 )
 
+// resetState resets package-level tracing globals between tests so that
+// Init can be called multiple times within the same test binary run.
+func resetState(t *testing.T) {
+	t.Helper()
+	tracerProvider = nil
+	tracerProviderOnce = sync.Once{}
+}
+
 func TestInitDisabled(t *testing.T) {
+	resetState(t)
 	cfg := config.TracingConfig{Enabled: false}
 	cleanup, err := Init(cfg)
 	if err != nil {
@@ -24,6 +34,7 @@ func TestInitDisabled(t *testing.T) {
 }
 
 func TestInitEnabled(t *testing.T) {
+	resetState(t)
 	cfg := config.TracingConfig{
 		Enabled:         true,
 		ServiceName:     "test-service",
@@ -95,31 +106,6 @@ func TestContextWithCorrelationID(t *testing.T) {
 		result := ContextWithCorrelationID(ctx, "req-123")
 		if result == nil {
 			t.Error("expected non-nil context")
-		}
-	})
-}
-
-func TestMiddleware(t *testing.T) {
-	t.Run("wraps handler without error", func(t *testing.T) {
-		handler := func(ctx context.Context) error {
-			return nil
-		}
-		wrapped := Middleware(handler)
-		err := wrapped(context.Background())
-		if err != nil {
-			t.Errorf("unexpected error: %v", err)
-		}
-	})
-
-	t.Run("wraps handler with error", func(t *testing.T) {
-		expected := errors.New("handler error")
-		handler := func(ctx context.Context) error {
-			return expected
-		}
-		wrapped := Middleware(handler)
-		err := wrapped(context.Background())
-		if err != expected {
-			t.Errorf("expected %v, got %v", expected, err)
 		}
 	})
 }

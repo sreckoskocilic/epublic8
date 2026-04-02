@@ -56,6 +56,7 @@ type WebHandler struct {
 	metricsCfg      config.MetricsConfig
 	uploadLimiters  sync.Map      // map[string]*rate.Limiter, keyed by remote IP
 	limiterStopCh   chan struct{} // closed by Close() to stop the pruning goroutine
+	closeOnce       sync.Once     // ensures Close() is idempotent
 	authHandler     http.Handler  // pre-built auth-wrapped handler; nil if no auth configured
 }
 
@@ -110,6 +111,7 @@ func NewWebHandler(docHandler *DocumentHandler, outputDir string, securityCfg co
 		metricsCfg:      metricsCfg,
 		uploadLimiters:  sync.Map{},
 		limiterStopCh:   make(chan struct{}),
+		closeOnce:       sync.Once{},
 		authHandler:     nil,
 	}
 	if securityCfg.BasicAuth != "" {
@@ -147,6 +149,24 @@ var protectedPaths = map[string]bool{
 }
 
 func (h *WebHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if len(h.securityCfg.AllowedHosts) > 0 {
+		host, _, err := net.SplitHostPort(r.Host)
+		if err != nil {
+			host = r.Host // no port component
+		}
+		allowed := false
+		for _, ah := range h.securityCfg.AllowedHosts {
+			if strings.EqualFold(host, ah) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+	}
+
 	path := r.URL.Path
 	isProtected := protectedPaths[path]
 
@@ -273,9 +293,27 @@ func (h *WebHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Per-IP rate limit: uploadBurst uploads per minute.
-	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
-	if ip == "" {
-		ip = r.RemoteAddr // fallback if parsing fails
+	// Prefer X-Forwarded-For/X-Real-IP so limits key on the real client IP
+	// rather than the K8s LoadBalancer proxy IP.
+	// IMPORTANT: this assumes the service is deployed behind a trusted proxy
+	// (e.g. K8s Ingress / cloud LB) that strips or overwrites these headers
+	// before forwarding. Exposing the service directly to untrusted traffic
+	// would allow clients to spoof X-Forwarded-For and bypass rate limiting.
+	var ip string
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		// X-Forwarded-For may be "client, proxy1, proxy2" — use the first entry.
+		if idx := strings.IndexByte(xff, ','); idx != -1 {
+			ip = strings.TrimSpace(xff[:idx])
+		} else {
+			ip = strings.TrimSpace(xff)
+		}
+	} else if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		ip = strings.TrimSpace(xri)
+	} else {
+		ip, _, _ = net.SplitHostPort(r.RemoteAddr)
+		if ip == "" {
+			ip = r.RemoteAddr
+		}
 	}
 	limiterVal, ok := h.uploadLimiters.Load(ip)
 	if !ok {
@@ -370,8 +408,8 @@ func (h *WebHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Process with a 10-minute timeout.
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	// Process with a timeout.
+	ctx, cancel := context.WithTimeout(ctx, processTimeout)
 	defer cancel()
 
 	logf := func(format string, args ...any) {
@@ -417,10 +455,12 @@ func (h *WebHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 	var docResult *model.ProcessResult
 	select {
 	case <-ctx.Done():
-		sendEvent("error", "conversion timed out after 10 minutes")
+		metrics.RecordDocumentProcessed(false)
+		sendEvent("error", fmt.Sprintf("conversion timed out after %s", processTimeout))
 		return
 	case res := <-resCh:
 		if res.err != nil {
+			metrics.RecordDocumentProcessed(false)
 			logf("Processing error: %v", res.err)
 			sendEvent("error", res.err.Error())
 			return
@@ -440,6 +480,7 @@ func (h *WebHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	epubResult, err := h.epubGenerator.GenerateFromText(docResult.ExtractedText, docResult.Images, docResult.PageCount, title, author, docResult.Language)
 	if err != nil {
+		metrics.RecordDocumentProcessed(false)
 		logf("EPUB generation error: %v", err)
 		sendEvent("error", err.Error())
 		return
@@ -455,6 +496,7 @@ func (h *WebHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 	filename := fmt.Sprintf("%s_%s.epub", sanitizeFilename(title), randSuffix)
 	epubPath := filepath.Join(h.uploadDir, filename)
 	if err := h.generateEPUBFile(epubResult, epubPath); err != nil {
+		metrics.RecordDocumentProcessed(false)
 		logf("EPUB file error: %v", err)
 		if removeErr := os.Remove(epubPath); removeErr != nil && !os.IsNotExist(removeErr) {
 			errors.LogWarn("failed to remove partial EPUB %s: %v", epubPath, removeErr)
@@ -494,6 +536,7 @@ func (h *WebHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		sendEvent("error", "internal server error")
 		return
 	}
+	metrics.RecordDocumentProcessed(true)
 	fmt.Fprintf(w, "data: %s\n\n", doneJSON)
 	flusher.Flush()
 }
@@ -988,12 +1031,11 @@ func isUpperStart(r rune) bool {
 }
 
 func (h *WebHandler) Close() error {
-	close(h.limiterStopCh)
+	h.closeOnce.Do(func() {
+		close(h.limiterStopCh)
+	})
 	if !h.persistentDir {
 		os.RemoveAll(h.uploadDir)
-	}
-	if h.epubGenerator != nil {
-		h.epubGenerator.Close()
 	}
 	return nil
 }

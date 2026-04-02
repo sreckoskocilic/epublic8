@@ -141,6 +141,8 @@ service DocumentService {
 | GET | `/download?file=filename` | Download generated EPUB |
 | GET | `/metrics` | Prometheus metrics endpoint |
 
+> **Rate limiting note**: per-IP upload rate limiting reads `X-Forwarded-For` / `X-Real-IP` to key on the real client address. The service must be deployed behind a trusted proxy (K8s Ingress, cloud load balancer) that strips or overwrites these headers before forwarding. Direct exposure to untrusted traffic would allow clients to spoof the header and bypass rate limits.
+
 #### `POST /api/upload`
 
 Upload form fields:
@@ -233,7 +235,7 @@ Use `-config` flag or `CONFIG_PATH` environment variable to load config file:
 | `ALLOWED_HOSTS` | - | Comma-separated list of allowed Host headers |
 | `TRACING_ENABLED` | `false` | Enable OpenTelemetry tracing |
 | `TRACING_SERVICE_NAME` | `epublic8` | Service name for tracing |
-| `TRACING_CONSOLE_EXPORTER` | `true` | Enable console tracing output |
+| `TRACING_CONSOLE_EXPORTER` | `true` | Reserved for future console exporter wiring; currently has no effect |
 | `METRICS_ENABLED` | `true` | Enable Prometheus metrics |
 | `METRICS_PATH` | `/metrics` | Metrics endpoint path |
 

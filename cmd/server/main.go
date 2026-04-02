@@ -25,20 +25,41 @@ import (
 const pidFile = "document-service.pid"
 
 func writePID() {
-	// Remove a stale PID file from a previous crash before writing a new one.
+	// Remove a stale PID file from a previous crash.
 	if data, err := os.ReadFile(pidFile); err == nil {
 		if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil {
 			if proc, err := os.FindProcess(pid); err == nil {
 				// Signal 0 checks existence without sending a real signal.
 				if proc.Signal(syscall.Signal(0)) != nil {
 					log.Printf("removing stale PID file (pid %d no longer running)", pid)
-					os.Remove(pidFile)
+					if err := os.Remove(pidFile); err != nil && !os.IsNotExist(err) {
+						log.Printf("warning: could not remove stale PID file: %v", err)
+					}
 				}
 			}
 		}
 	}
-	if err := os.WriteFile(pidFile, []byte(fmt.Sprintf("%d", os.Getpid())), 0600); err != nil {
+	// Write to a temp file in the same directory, then rename atomically so
+	// another process cannot observe a partially-written PID file.
+	tmp, err := os.CreateTemp(".", ".pid-tmp-*")
+	if err != nil {
+		log.Printf("warning: could not create temp PID file: %v", err)
+		return
+	}
+	if _, err := fmt.Fprintf(tmp, "%d", os.Getpid()); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
 		log.Printf("warning: could not write PID file: %v", err)
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmp.Name())
+		log.Printf("warning: could not close temp PID file: %v", err)
+		return
+	}
+	if err := os.Rename(tmp.Name(), pidFile); err != nil {
+		os.Remove(tmp.Name())
+		log.Printf("warning: could not rename PID file: %v", err)
 	}
 }
 
@@ -69,6 +90,9 @@ func main() {
 		}
 	}()
 
+	// gRPC is capped at 100 MB while the HTTP upload endpoint accepts 200 MB.
+	// gRPC buffers the entire message in-process before handing it to the handler,
+	// so a lower limit reduces peak memory exposure. HTTP streams the body.
 	grpcServer := grpc.NewServer(
 		grpc.MaxRecvMsgSize(100 * 1024 * 1024),
 	)
@@ -108,7 +132,10 @@ func main() {
 		Handler:           metrics.Middleware(cfg.Metrics.Path, http.HandlerFunc(webHandler.ServeHTTP)),
 		ReadTimeout:       60 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       120 * time.Second,
+		// 15 minutes covers the 10-minute processing timeout plus headroom for SSE
+		// streaming to complete; also bounds slow-write clients on non-SSE endpoints.
+		WriteTimeout: 15 * time.Minute,
+		IdleTimeout:  120 * time.Second,
 	}
 	go func() {
 		log.Printf("HTTP server listening on :%s", cfg.Server.HTTPPort)
@@ -117,10 +144,10 @@ func main() {
 		}
 	}()
 
-	fmt.Printf("Document Processing Service ready:\n")
-	fmt.Printf("  gRPC: :%s\n", cfg.Server.GRPCPort)
-	fmt.Printf("  HTTP:  http://localhost:%s\n", cfg.Server.HTTPPort)
-	fmt.Printf("  OCR Languages: %v\n", cfg.OCR.Languages)
+	log.Printf("Document Processing Service ready:")
+	log.Printf("  gRPC: :%s", cfg.Server.GRPCPort)
+	log.Printf("  HTTP:  http://localhost:%s", cfg.Server.HTTPPort)
+	log.Printf("  OCR Languages: %v", cfg.OCR.Languages)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)

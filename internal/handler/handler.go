@@ -91,8 +91,8 @@ func (h *DocumentHandler) ProcessDocument(ctx context.Context, req *pb.DocumentR
 	)
 	defer span.End()
 
-	h.incrementRequests()
-	defer h.decrementRequests()
+	h.activeRequests.Add(1)
+	defer h.activeRequests.Add(-1)
 
 	// Enforce a processing timeout matching the HTTP path.
 	ctx, cancel := context.WithTimeout(ctx, processTimeout)
@@ -126,8 +126,8 @@ func (h *DocumentHandler) StreamProcessDocument(stream pb.DocumentService_Stream
 	ctx, span := tracing.StartSpan(stream.Context(), "StreamProcessDocument")
 	defer span.End()
 
-	h.incrementRequests()
-	defer h.decrementRequests()
+	h.activeRequests.Add(1)
+	defer h.activeRequests.Add(-1)
 
 	var documentID string
 	var mimeType string
@@ -270,13 +270,13 @@ func getEntityPatterns(entityType string) []*regexp.Regexp {
 
 // deduplicateEntities removes duplicate entities based on text and type.
 func deduplicateEntities(entities []*pb.Entity) []*pb.Entity {
-	seen := make(map[string]bool)
+	seen := make(map[string]struct{})
 	var result []*pb.Entity
 
 	for _, e := range entities {
 		key := e.Type + ":" + e.Text
-		if !seen[key] {
-			seen[key] = true
+		if _, ok := seen[key]; !ok {
+			seen[key] = struct{}{}
 			result = append(result, e)
 		}
 	}
@@ -286,14 +286,6 @@ func deduplicateEntities(entities []*pb.Entity) []*pb.Entity {
 
 func (h *DocumentHandler) Register(grpcServer *grpc.Server) {
 	pb.RegisterDocumentServiceServer(grpcServer, h)
-}
-
-func (h *DocumentHandler) incrementRequests() {
-	h.activeRequests.Add(1)
-}
-
-func (h *DocumentHandler) decrementRequests() {
-	h.activeRequests.Add(-1)
 }
 
 func (h *DocumentHandler) Close() error {

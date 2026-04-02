@@ -4,8 +4,6 @@ package errors
 
 import (
 	"errors"
-	"io"
-	"os"
 	"testing"
 )
 
@@ -136,103 +134,5 @@ func TestConfigError(t *testing.T) {
 		if cw.Err != underlying {
 			t.Error("NewConfigError.Err did not wrap underlying error")
 		}
-	}
-}
-
-func TestHandleFileError(t *testing.T) {
-	// Test nil error
-	if HandleFileError(nil, "op", "path") {
-		t.Error("HandleFileError(nil) should return false")
-	}
-
-	// Test os.ErrNotExist
-	if !HandleFileError(os.ErrNotExist, "op", "/missing/file") {
-		t.Error("HandleFileError(os.ErrNotExist) should return true")
-	}
-
-	// Test os.ErrPermission
-	if !HandleFileError(os.ErrPermission, "op", "/protected/file") {
-		t.Error("HandleFileError(os.ErrPermission) should return true")
-	}
-
-	// Test other error (should return false)
-	if HandleFileError(errors.New("other error"), "op", "/some/file") {
-		t.Error("HandleFileError(other) should return false")
-	}
-}
-
-func TestHandleTempFileError(t *testing.T) {
-	// Test nil error
-	if HandleTempFileError(nil, "pattern") {
-		t.Error("HandleTempFileError(nil) should return false")
-	}
-
-	// Test non-nil error (should return true)
-	if !HandleTempFileError(errors.New("temp file error"), "pattern") {
-		t.Error("HandleTempFileError(non-nil) should return true")
-	}
-}
-
-func TestIsTemporary(t *testing.T) {
-	// Test nil error
-	if IsTemporary(nil) {
-		t.Error("IsTemporary(nil) should return false")
-	}
-
-	// Test io.ErrUnexpectedEOF (should be temporary)
-	result := IsTemporary(io.ErrUnexpectedEOF)
-	if !result {
-		t.Errorf("IsTemporary(io.ErrUnexpectedEOF) should return true, got %v", result)
-	}
-
-	// Test os.ErrPermission (should NOT be temporary)
-	if IsTemporary(os.ErrPermission) {
-		t.Error("IsTemporary(os.ErrPermission) should return false")
-	}
-
-	// Test wrapped error
-	pathErr := &os.PathError{Op: "open", Err: io.ErrUnexpectedEOF, Path: "/test"}
-	if !IsTemporary(pathErr) {
-		t.Error("IsTemporary(wrapped os.PathError with unexpected EOF) should return true")
-	}
-}
-
-func TestWithOp(t *testing.T) {
-	// Test nil error
-	if WithOp(nil, "op") != nil {
-		t.Error("WithOp(nil) should return nil")
-	}
-
-	// Test non-nil error
-	underlying := errors.New("underlying")
-	wrapped := WithOp(underlying, "test op")
-	if wrapped == nil {
-		t.Error("WithOp(non-nil) should not return nil")
-	}
-	if !errors.Is(wrapped, underlying) {
-		t.Error("WithOp should preserve underlying error via errors.Is")
-	}
-	if wrapped.Error() != "test op: underlying" {
-		t.Errorf("WithOp.Error() = %q, want 'test op: underlying'", wrapped.Error())
-	}
-}
-
-func TestWithContext(t *testing.T) {
-	// Test nil error
-	if WithContext(nil, "format %s", "arg") != nil {
-		t.Error("WithContext(nil) should return nil")
-	}
-
-	// Test non-nil error
-	underlying := errors.New("underlying")
-	wrapped := WithContext(underlying, "format %s", "arg")
-	if wrapped == nil {
-		t.Error("WithContext(non-nil) should not return nil")
-	}
-	if !errors.Is(wrapped, underlying) {
-		t.Error("WithContext should preserve underlying error via errors.Is")
-	}
-	if wrapped.Error() != "format arg: underlying" {
-		t.Errorf("WithContext.Error() = %q, want 'format arg: underlying'", wrapped.Error())
 	}
 }

@@ -54,7 +54,7 @@ func Init(cfg config.TracingConfig) (func() error, error) {
 
 		log.Printf("tracing: enabled (service=%s)", cfg.ServiceName)
 		if cfg.ConsoleExporter {
-			log.Println("tracing: console exporter enabled")
+			log.Println("tracing: console exporter configured (no span exporter attached; spans are discarded)")
 		}
 	})
 
@@ -120,20 +120,4 @@ func ContextWithCorrelationID(ctx context.Context, correlationID string) context
 		span.SetAttributes(attribute.String("correlation.id", correlationID))
 	}
 	return ctx
-}
-
-// Middleware wraps an HTTP handler function with tracing.
-// This is a convenience function for adding tracing to HTTP handlers.
-func Middleware(h func(ctx context.Context) error) func(ctx context.Context) error {
-	return func(ctx context.Context) error {
-		ctx, span := StartSpan(ctx, "http.request")
-		defer span.End()
-
-		if err := h(ctx); err != nil {
-			AddSpanError(ctx, err)
-			return err
-		}
-
-		return nil
-	}
 }

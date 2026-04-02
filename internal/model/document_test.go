@@ -773,9 +773,3 @@ func TestDocumentProcessorClose(t *testing.T) {
 		t.Errorf("unexpected error on close: %v", err)
 	}
 }
-
-func TestEPUBGeneratorClose(t *testing.T) {
-	g := NewEPUBGenerator(0)
-	// Close should not panic
-	g.Close()
-}

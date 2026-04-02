@@ -5,9 +5,7 @@ package errors
 import (
 	"errors"
 	"fmt"
-	"io"
 	"log"
-	"os"
 )
 
 // Level represents the severity level for error logging.
@@ -155,69 +153,4 @@ func (e *ConfigError) Unwrap() error {
 // NewConfigError creates a new ConfigError.
 func NewConfigError(key string, value string, err error) error {
 	return &ConfigError{Key: key, Value: value, Err: err}
-}
-
-// HandleFileError handles file-related errors consistently.
-// It returns true if the error was handled (logged), false if it should be returned.
-func HandleFileError(err error, op string, path string) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, os.ErrNotExist) {
-		LogWarn("file not found: %s (%s)", path, op)
-		return true
-	}
-	if errors.Is(err, os.ErrPermission) {
-		LogError(err, "permission denied: %s (%s)", path, op)
-		return true
-	}
-	// For other errors, log and return false to let caller handle
-	LogError(err, "file error: %s (%s)", path, op)
-	return false
-}
-
-// HandleTempFileError handles temporary file creation errors.
-func HandleTempFileError(err error, pattern string) bool {
-	if err == nil {
-		return false
-	}
-	LogError(err, "failed to create temp file: %s", pattern)
-	return true
-}
-
-// IsTemporary returns true if the error is likely temporary and retryable.
-func IsTemporary(err error) bool {
-	if err == nil {
-		return false
-	}
-	// Check for common temporary error conditions
-	if errors.Is(err, io.ErrUnexpectedEOF) {
-		return true
-	}
-	if errors.Is(err, os.ErrPermission) {
-		return false // Not temporary
-	}
-	// Network-related or timeout errors would be temporary but we don't have net pkg here
-	// Consider errors that wrap known temporary errors
-	var perr *os.PathError
-	if errors.As(err, &perr) {
-		return IsTemporary(perr.Err)
-	}
-	return false
-}
-
-// WithOp wraps an error with an operation context.
-func WithOp(err error, op string) error {
-	if err == nil {
-		return nil
-	}
-	return fmt.Errorf("%s: %w", op, err)
-}
-
-// WithContext wraps an error with additional context information.
-func WithContext(err error, format string, args ...any) error {
-	if err == nil {
-		return nil
-	}
-	return fmt.Errorf("%s: %w", fmt.Sprintf(format, args...), err)
 }

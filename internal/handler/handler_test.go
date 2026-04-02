@@ -328,7 +328,7 @@ func TestHealthCheckWithActiveRequests(t *testing.T) {
 	h := NewDocumentHandler(0, nil)
 
 	// Simulate an active request
-	h.incrementRequests()
+	h.activeRequests.Add(1)
 
 	req := &epb.HealthRequest{}
 	resp, err := h.Health(context.Background(), req)
@@ -340,7 +340,7 @@ func TestHealthCheckWithActiveRequests(t *testing.T) {
 		t.Errorf("expected 1 active request, got %d", resp.ActiveRequests)
 	}
 
-	h.decrementRequests()
+	h.activeRequests.Add(-1)
 
 	// Verify it decremented
 	resp2, err := h.Health(context.Background(), req)
