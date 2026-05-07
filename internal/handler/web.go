@@ -16,11 +16,13 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"golang.org/x/time/rate"
 
@@ -42,6 +44,10 @@ var (
 	Commit    = "unknown"
 	BuildTime = "unknown"
 )
+
+const processTimeout = 10 * time.Minute
+
+var reHyphenBreak = regexp.MustCompile(`([a-z\x{00e0}-\x{024f}])-\n([a-z\x{00e0}-\x{024f}])`)
 
 // uploadBurst is the per-IP burst size for upload rate limiting (10 per minute).
 const uploadBurst = 10
@@ -698,12 +704,16 @@ func (z *epubZip) close() error {
 	return z.zw.Close()
 }
 
-func (h *WebHandler) generateEPUBFile(epubResult *model.EPUBResult, outPath string) error {
+func (h *WebHandler) generateEPUBFile(epubResult *model.EPUBResult, outPath string) (retErr error) {
 	f, err := os.Create(outPath)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		if cerr := f.Close(); cerr != nil && retErr == nil {
+			retErr = cerr
+		}
+	}()
 	z := &epubZip{zw: zip.NewWriter(f), err: nil}
 
 	// mimetype must be the first entry and stored uncompressed per EPUB spec.
@@ -819,11 +829,14 @@ func (h *WebHandler) generateEPUBFile(epubResult *model.EPUBResult, outPath stri
 			// Candidates in priority order: caption-start paragraph first,
 			// then any paragraph that mentions the figure number.
 			candidates := []string{
-				fmt.Sprintf("<p>Fig. %d", figNum),
-				fmt.Sprintf("<p>Fig %d", figNum),
-				fmt.Sprintf("<p>fig. %d", figNum),
-				fmt.Sprintf("Fig. %d", figNum),
-				fmt.Sprintf("Fig %d", figNum),
+				fmt.Sprintf("<p>Fig. %d ", figNum),
+				fmt.Sprintf("<p>Fig. %d.", figNum),
+				fmt.Sprintf("<p>Fig. %d<", figNum),
+				fmt.Sprintf("<p>Fig %d ", figNum),
+				fmt.Sprintf("<p>fig. %d ", figNum),
+				fmt.Sprintf("Fig. %d ", figNum),
+				fmt.Sprintf("Fig. %d.", figNum),
+				fmt.Sprintf("Fig %d ", figNum),
 			}
 			for _, needle := range candidates {
 				idx := strings.Index(bodyHTML, needle)
@@ -899,7 +912,7 @@ func (h *WebHandler) generateEPUBFile(epubResult *model.EPUBResult, outPath stri
 func textToHTML(text string) string {
 	// 1. Join soft-hyphenated breaks: "wor­\nld" → "world", "wor-\nld" → "world"
 	text = strings.ReplaceAll(text, "\u00ad\n", "") // soft hyphen
-	text = strings.ReplaceAll(text, "-\n", "")      // line-break hyphen
+	text = reHyphenBreak.ReplaceAllString(text, "$1$2") // line-break hyphen (only lowercase-lowercase)
 
 	// 2. Split into lines and detect paragraph boundaries.
 	lines := strings.Split(text, "\n")
@@ -918,7 +931,7 @@ func textToHTML(text string) string {
 		return first == '„' || first == '"' || first == '—' || first == '-' ||
 			(first >= 'A' && first <= 'Z') ||
 			(first >= 'А' && first <= 'Я') || // Cyrillic uppercase
-			(first >= 0x00C0 && first <= 0x024F) // Latin extended uppercase (Č Š Ž Ć Đ…)
+			unicode.IsUpper(first)
 	}
 
 	// lastRune tracks the last rune appended to current for sentence-end detection.
@@ -1026,7 +1039,7 @@ func splitAtSentenceBoundaries(para string, maxSentences int) []string {
 func isUpperStart(r rune) bool {
 	return (r >= 'A' && r <= 'Z') ||
 		(r >= 'А' && r <= 'Я') || // Cyrillic uppercase
-		(r >= 0x00C0 && r <= 0x024F) || // Latin extended (Č Š Ž Ć Đ…)
+		unicode.IsUpper(r) ||
 		r == '"' || r == '„' || r == '—' || r == '-'
 }
 

@@ -11,9 +11,6 @@ func TestDefault(t *testing.T) {
 	cfg := Default()
 
 	// Server defaults
-	if cfg.Server.GRPCPort != "50051" {
-		t.Errorf("expected GRPCPort 50051, got %s", cfg.Server.GRPCPort)
-	}
 	if cfg.Server.HTTPPort != "8080" {
 		t.Errorf("expected HTTPPort 8080, got %s", cfg.Server.HTTPPort)
 	}
@@ -69,7 +66,6 @@ func TestLoadNoConfigFile(t *testing.T) {
 
 func TestLoadWithEnvOverrides(t *testing.T) {
 	// Set environment variables
-	t.Setenv("GRPC_PORT", "50052")
 	t.Setenv("HTTP_PORT", "9090")
 	t.Setenv("OCR_CONCURRENCY", "4")
 	t.Setenv("OCR_LANGUAGES", "eng,fra,deu")
@@ -91,9 +87,6 @@ func TestLoadWithEnvOverrides(t *testing.T) {
 	}
 
 	// Verify env overrides
-	if cfg.Server.GRPCPort != "50052" {
-		t.Errorf("expected GRPC_PORT 50052, got %s", cfg.Server.GRPCPort)
-	}
 	if cfg.Server.HTTPPort != "9090" {
 		t.Errorf("expected HTTP_PORT 9090, got %s", cfg.Server.HTTPPort)
 	}
@@ -211,7 +204,6 @@ func TestLoadYAMLConfigFile(t *testing.T) {
 
 	yamlContent := `
 server:
-  grpcPort: "50052"
   httpPort: "9090"
 ocr:
   concurrency: 8
@@ -247,9 +239,6 @@ metrics:
 	}
 
 	// Verify YAML config is loaded
-	if cfg.Server.GRPCPort != "50052" {
-		t.Errorf("expected grpcPort 50052, got %s", cfg.Server.GRPCPort)
-	}
 	if cfg.Server.HTTPPort != "9090" {
 		t.Errorf("expected httpPort 9090, got %s", cfg.Server.HTTPPort)
 	}
@@ -298,13 +287,12 @@ metrics:
 }
 
 func TestLoadYAMLWithEnvOverride(t *testing.T) {
-	// Create a temporary config file
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")
 
 	yamlContent := `
 server:
-  grpcPort: "50052"
+  httpPort: "9090"
 ocr:
   concurrency: 8
 `
@@ -312,39 +300,34 @@ ocr:
 		t.Fatalf("failed to write config: %v", err)
 	}
 
-	// Set env var to override YAML
-	t.Setenv("GRPC_PORT", "50053")
+	t.Setenv("HTTP_PORT", "7070")
 
 	cfg, err := Load(configPath)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Env var should override YAML
-	if cfg.Server.GRPCPort != "50053" {
-		t.Errorf("expected env override to take precedence, got %s", cfg.Server.GRPCPort)
+	if cfg.Server.HTTPPort != "7070" {
+		t.Errorf("expected env override to take precedence, got %s", cfg.Server.HTTPPort)
 	}
 
-	// YAML value should be preserved for non-overridden fields
 	if cfg.OCR.Concurrency != 8 {
 		t.Errorf("expected yaml value preserved, got %d", cfg.OCR.Concurrency)
 	}
 }
 
 func TestLoadFromCONFIG_PATH(t *testing.T) {
-	// Create a temporary config file
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")
 
 	yamlContent := `
 server:
-  grpcPort: "50055"
+  httpPort: "7777"
 `
 	if err := os.WriteFile(configPath, []byte(yamlContent), 0600); err != nil {
 		t.Fatalf("failed to write config: %v", err)
 	}
 
-	// Set CONFIG_PATH env var
 	t.Setenv("CONFIG_PATH", configPath)
 
 	cfg, err := Load("")
@@ -352,15 +335,14 @@ server:
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if cfg.Server.GRPCPort != "50055" {
-		t.Errorf("expected grpcPort 50055, got %s", cfg.Server.GRPCPort)
+	if cfg.Server.HTTPPort != "7777" {
+		t.Errorf("expected httpPort 7777, got %s", cfg.Server.HTTPPort)
 	}
 }
 
 func TestConfigString(t *testing.T) {
 	cfg := &Config{
 		Server: ServerConfig{
-			GRPCPort: "50051",
 			HTTPPort: "8080",
 		},
 		Security: SecurityConfig{

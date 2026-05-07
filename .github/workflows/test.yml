@@ -6,25 +6,29 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: go.mod
 
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y poppler-utils tesseract-ocr
+
       - name: Run tests
-        run: |
-          sudo apt-get install poppler-utils tesseract-ocr
-          go test ./...
+        run: go test ./...
 
       - name: Install golangci-lint
-        run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+        run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.62.0
 
       - name: Run lint
         run: golangci-lint run ./...

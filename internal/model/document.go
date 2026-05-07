@@ -992,9 +992,8 @@ func (p *DocumentProcessor) processPageFootnotes(text string) string {
 }
 
 func (p *DocumentProcessor) Close() error {
-	if visionOCRBin != "" {
-		os.Remove(visionOCRBin)
-	}
+	// visionOCRBin lives in os.TempDir() and is cleaned by the OS on reboot.
+	// Removing it here races with in-flight OCR goroutines during shutdown.
 	return nil
 }
 

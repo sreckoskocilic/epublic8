@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -19,7 +18,6 @@ import (
 	"epublic8/internal/metrics"
 	"epublic8/internal/model"
 	"epublic8/internal/tracing"
-	"google.golang.org/grpc"
 )
 
 const pidFile = "document-service.pid"
@@ -90,19 +88,10 @@ func main() {
 		}
 	}()
 
-	// gRPC is capped at 100 MB while the HTTP upload endpoint accepts 200 MB.
-	// gRPC buffers the entire message in-process before handing it to the handler,
-	// so a lower limit reduces peak memory exposure. HTTP streams the body.
-	grpcServer := grpc.NewServer(
-		grpc.MaxRecvMsgSize(100 * 1024 * 1024),
-	)
-
 	model.LogToolAvailability(log.Printf)
 
 	docHandler := handler.NewDocumentHandler(cfg.OCR.Concurrency, cfg.OCR.Languages)
 	defer docHandler.Close()
-
-	docHandler.Register(grpcServer)
 
 	webHandler, err := handler.NewWebHandler(docHandler, cfg.EPUB.OutputDir, cfg.Security, cfg.Metrics, cfg.EPUB.ChapterWords)
 	if err != nil {
@@ -116,26 +105,13 @@ func main() {
 		go cleanupLoop(cleanupCtx, cfg.EPUB.OutputDir, cfg.Cleanup.RetentionHours, cfg.Cleanup.IntervalHours)
 	}
 
-	go func() {
-		lis, err := net.Listen("tcp", ":"+cfg.Server.GRPCPort)
-		if err != nil {
-			log.Fatalf("failed to listen on grpc port: %v", err)
-		}
-		log.Printf("gRPC server listening on :%s", cfg.Server.GRPCPort)
-		if err := grpcServer.Serve(lis); err != nil {
-			log.Fatalf("failed to serve grpc: %v", err)
-		}
-	}()
-
 	httpServer := &http.Server{
 		Addr:              ":" + cfg.Server.HTTPPort,
 		Handler:           metrics.Middleware(cfg.Metrics.Path, http.HandlerFunc(webHandler.ServeHTTP)),
 		ReadTimeout:       60 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,
-		// 15 minutes covers the 10-minute processing timeout plus headroom for SSE
-		// streaming to complete; also bounds slow-write clients on non-SSE endpoints.
-		WriteTimeout: 15 * time.Minute,
-		IdleTimeout:  120 * time.Second,
+		WriteTimeout:      15 * time.Minute,
+		IdleTimeout:       120 * time.Second,
 	}
 	go func() {
 		log.Printf("HTTP server listening on :%s", cfg.Server.HTTPPort)
@@ -144,29 +120,14 @@ func main() {
 		}
 	}()
 
-	log.Printf("Document Processing Service ready:")
-	log.Printf("  gRPC: :%s", cfg.Server.GRPCPort)
-	log.Printf("  HTTP:  http://localhost:%s", cfg.Server.HTTPPort)
+	log.Printf("Document Processing Service ready: http://localhost:%s", cfg.Server.HTTPPort)
 	log.Printf("  OCR Languages: %v", cfg.OCR.Languages)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 
-	log.Println("Shutting down servers...")
-
-	grpcDone := make(chan struct{})
-	go func() {
-		grpcServer.GracefulStop()
-		close(grpcDone)
-	}()
-	select {
-	case <-grpcDone:
-	case <-time.After(15 * time.Second):
-		log.Println("gRPC graceful stop timed out, forcing stop")
-		grpcServer.Stop()
-	}
-
+	log.Println("Shutting down...")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := httpServer.Shutdown(ctx); err != nil {

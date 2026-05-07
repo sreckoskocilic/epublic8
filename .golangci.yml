@@ -26,15 +26,10 @@ linters-settings:
         severity: warning
   exhaustruct:
     exclude:
-      - ".*\\.pb\\.go"
-      - "google\\.golang\\.org/.*"
-      - "epublic8/pb\\..*"      # proto-generated types used in handlers
       - "archive/zip\\.FileHeader" # stdlib with many optional fields
       - "net/http\\.Server"     # stdlib with many optional fields
 
 issues:
-  exclude-dirs:
-    - pb
   exclude-rules:
     - path: "_test\\.go"
       linters:

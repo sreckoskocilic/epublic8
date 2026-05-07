@@ -48,9 +48,29 @@ func TestTextToHTMLSoftHyphenJoined(t *testing.T) {
 
 func TestTextToHTMLHyphenLineBreakJoined(t *testing.T) {
 	got := textToHTML("auto-\nmatic")
-	// Line-break hyphens are removed: "auto-\nmatic" → "automatic"
 	if !strings.Contains(got, "automatic") {
 		t.Errorf("expected hyphen removed on line break, got: %s", got)
+	}
+}
+
+func TestTextToHTMLHyphenBeforeUppercasePreserved(t *testing.T) {
+	got := textToHTML("German-\nEnglish dictionary.")
+	if !strings.Contains(got, "German-") {
+		t.Errorf("hyphen before uppercase should be preserved, got: %s", got)
+	}
+}
+
+func TestTextToHTMLAccentedLowercaseNoNewParagraph(t *testing.T) {
+	got := textToHTML("some text\nčetvrti red nastavka.")
+	if strings.Count(got, "<p>") != 1 {
+		t.Errorf("lowercase accented char should not start new paragraph, got: %s", got)
+	}
+}
+
+func TestTextToHTMLAccentedUppercaseStartsParagraph(t *testing.T) {
+	got := textToHTML("End of sentence.\nČetvrti paragraf počinje.")
+	if strings.Count(got, "<p>") != 2 {
+		t.Errorf("uppercase accented char should start new paragraph, got: %s", got)
 	}
 }
 
@@ -93,6 +113,12 @@ func TestIsUpperStart(t *testing.T) {
 		{'А', true},  // Cyrillic uppercase
 		{'я', false}, // Cyrillic lowercase
 		{'Č', true},  // Latin extended uppercase
+		{'č', false}, // Latin extended lowercase
+		{'à', false}, // Lowercase accented
+		{'ž', false}, // Lowercase with caron
+		{'Š', true},  // Uppercase with caron
+		{'Đ', true},  // Uppercase D with stroke
+		{'đ', false}, // Lowercase d with stroke
 		{'"', true},
 		{'„', true},
 		{'—', true},

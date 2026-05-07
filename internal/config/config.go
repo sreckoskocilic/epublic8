@@ -27,9 +27,8 @@ type Config struct {
 	Metrics  MetricsConfig  `yaml:"metrics"`
 }
 
-// ServerConfig holds gRPC and HTTP server settings.
+// ServerConfig holds HTTP server settings.
 type ServerConfig struct {
-	GRPCPort string `yaml:"grpcPort" env:"GRPC_PORT"`
 	HTTPPort string `yaml:"httpPort" env:"HTTP_PORT"`
 }
 
@@ -113,7 +112,6 @@ type MetricsConfig struct {
 func Default() *Config {
 	return &Config{
 		Server: ServerConfig{
-			GRPCPort: "50051",
 			HTTPPort: "8080",
 		},
 		OCR: OCRConfig{
@@ -199,9 +197,6 @@ func LoadFromFlag() (*Config, error) {
 // Environment variables take precedence over YAML config values.
 func applyEnvOverrides(cfg *Config) error {
 	// Server config
-	if v := os.Getenv("GRPC_PORT"); v != "" {
-		cfg.Server.GRPCPort = v
-	}
 	if v := os.Getenv("HTTP_PORT"); v != "" {
 		cfg.Server.HTTPPort = v
 	}

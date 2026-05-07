@@ -1,4 +1,4 @@
-FROM golang:1.26-bookworm AS builder
+FROM golang:1.25-bookworm AS builder
 
 ARG VERSION=dev
 ARG COMMIT=unknown
@@ -27,7 +27,7 @@ COPY --from=builder /app/document-service /usr/local/bin/document-service
 
 USER appuser
 
-EXPOSE 8080 50051
+EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -sf http://localhost:8080/health/live > /dev/null || exit 1
