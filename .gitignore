@@ -12,6 +12,9 @@ bin/
 .env.*
 !.env.example
 
+# Runtime
+*.pid
+
 # OS
 .DS_Store
 Thumbs.db

@@ -1,37 +1,48 @@
-run:
-  timeout: 5m
-
+version: "2"
 linters:
   enable:
-    - errcheck
-    - staticcheck
-    - govet
-    - gosec
-    - contextcheck
     - bodyclose
-    - revive
-    - unused
-    - nilerr
+    - contextcheck
     - exhaustruct
-
-linters-settings:
-  gosec:
-    excludes:
-      - G304 # file path from variable — acceptable in this service
-      - G204 # subprocess args are internally controlled
-      - G115 # int32 casts are intentional (proto field sizes)
-  revive:
+    - gosec
+    - nilerr
+    - revive
+  settings:
+    exhaustruct:
+      exclude:
+        - archive/zip\.FileHeader
+        - net/http\.Server
+    gosec:
+      excludes:
+        - G304 # file path from variable — acceptable in this service
+        - G204 # subprocess args are internally controlled
+        - G115 # int32 casts are intentional (proto field sizes)
+        - G703 # taint-analysis path traversal — paths are validated internally
+        - G706 # taint-analysis log injection — log inputs are hex-only or controlled
+    revive:
+      rules:
+        - name: exported
+          severity: warning
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
     rules:
-      - name: exported
-        severity: warning
-  exhaustruct:
-    exclude:
-      - "archive/zip\\.FileHeader" # stdlib with many optional fields
-      - "net/http\\.Server"     # stdlib with many optional fields
-
-issues:
-  exclude-rules:
-    - path: "_test\\.go"
-      linters:
-        - exhaustruct
-        - gosec
+      - linters:
+          - exhaustruct
+          - gosec
+        path: _test\.go
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

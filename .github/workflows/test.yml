@@ -25,10 +25,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y poppler-utils tesseract-ocr
 
       - name: Run tests
-        run: go test ./...
+        run: go test -race ./...
 
       - name: Install golangci-lint
-        run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.62.0
+        run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@v2.12.2
 
       - name: Run lint
         run: golangci-lint run ./...

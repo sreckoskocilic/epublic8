@@ -172,7 +172,7 @@ func TestRandomHexIsHex(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	for _, c := range got {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			t.Errorf("randomHex returned non-hex character %q in %q", c, got)
 		}
 	}

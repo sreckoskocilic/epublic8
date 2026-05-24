@@ -146,6 +146,8 @@ type ProcessOptions struct {
 	StripHeaders   bool // remove running headers from paginated PDFs
 	StripFootnotes bool // strip footnote sections from page bottoms
 	TextOnly       bool // skip embedded image extraction
+	PageFrom       int  // first page to process (1-based, 0 = start)
+	PageTo         int  // last page to process (1-based, 0 = end)
 }
 
 // DefaultProcessOptions returns sensible defaults: smart-OCR on, headers and
@@ -157,6 +159,8 @@ func DefaultProcessOptions() ProcessOptions {
 		StripFootnotes: true,
 		ForceOCR:       false,
 		TextOnly:       false,
+		PageFrom:       0,
+		PageTo:         0,
 	}
 }
 
@@ -185,9 +189,17 @@ type PDFImage struct {
 // extractPDFImages uses pdfimages to extract embedded images from pdfPath.
 // Returns nil when pdfimages is not available, on any error, or when all
 // images are smaller than 64×64 px (icons / bullets / noise).
-func extractPDFImages(ctx context.Context, pdfPath string, logf func(string, ...any)) []PDFImage {
+func extractPDFImages(ctx context.Context, pdfPath string, opts ProcessOptions, logf func(string, ...any)) []PDFImage {
 	// List images first to obtain page numbers and dimensions.
-	listOut, err := exec.CommandContext(ctx, "pdfimages", "-list", pdfPath).Output()
+	listArgs := []string{"-list"}
+	if opts.PageFrom > 0 {
+		listArgs = append(listArgs, "-f", strconv.Itoa(opts.PageFrom))
+	}
+	if opts.PageTo > 0 {
+		listArgs = append(listArgs, "-l", strconv.Itoa(opts.PageTo))
+	}
+	listArgs = append(listArgs, pdfPath)
+	listOut, err := exec.CommandContext(ctx, "pdfimages", listArgs...).Output()
 	if err != nil {
 		logf("pdfimages -list failed: %v", err)
 		return nil
@@ -225,7 +237,15 @@ func extractPDFImages(ctx context.Context, pdfPath string, logf func(string, ...
 	defer os.RemoveAll(tmpDir)
 
 	prefix := filepath.Join(tmpDir, "img")
-	if err := exec.CommandContext(ctx, "pdfimages", "-png", pdfPath, prefix).Run(); err != nil {
+	extractArgs := []string{"-png"}
+	if opts.PageFrom > 0 {
+		extractArgs = append(extractArgs, "-f", strconv.Itoa(opts.PageFrom))
+	}
+	if opts.PageTo > 0 {
+		extractArgs = append(extractArgs, "-l", strconv.Itoa(opts.PageTo))
+	}
+	extractArgs = append(extractArgs, pdfPath, prefix)
+	if err := exec.CommandContext(ctx, "pdfimages", extractArgs...).Run(); err != nil {
 		logf("pdfimages -png failed: %v", err)
 		return nil
 	}
@@ -536,7 +556,7 @@ func parsePDFFonts(ctx context.Context, pdfPath string) (hasUnmapped, likelyScan
 // pdfPageCount separately); it is set when OCR is used.
 func (p *DocumentProcessor) extractPDFTextFromPath(ctx context.Context, pdfPath string, opts ProcessOptions, logf func(string, ...any)) (string, []PDFImage, int) {
 	runOCR := func() (string, []PDFImage, int) {
-		if ocr, figs, n := p.extractPDFTextOCR(ctx, pdfPath, logf); ocr != "" {
+		if ocr, figs, n := p.extractPDFTextOCR(ctx, pdfPath, opts, logf); ocr != "" {
 			logf("OCR complete (%d chars)", len(ocr))
 			return p.processFootnotes(ocr, opts), figs, n
 		}
@@ -572,7 +592,15 @@ func (p *DocumentProcessor) extractPDFTextFromPath(ctx context.Context, pdfPath 
 	outFile.Close()
 	defer os.Remove(outputFile)
 
-	cmd := exec.CommandContext(ctx, "pdftotext", pdfPath, outputFile)
+	pdftextArgs := []string{}
+	if opts.PageFrom > 0 {
+		pdftextArgs = append(pdftextArgs, "-f", strconv.Itoa(opts.PageFrom))
+	}
+	if opts.PageTo > 0 {
+		pdftextArgs = append(pdftextArgs, "-l", strconv.Itoa(opts.PageTo))
+	}
+	pdftextArgs = append(pdftextArgs, pdfPath, outputFile)
+	cmd := exec.CommandContext(ctx, "pdftotext", pdftextArgs...)
 	if err := cmd.Run(); err != nil {
 		return fmt.Sprintf("[PDF Error: %v]", err), nil, 0
 	}
@@ -600,7 +628,7 @@ func (p *DocumentProcessor) extractPDFTextFromPath(ctx context.Context, pdfPath 
 	// Native-text PDF: extract embedded images unless text-only mode.
 	var images []PDFImage
 	if !opts.TextOnly {
-		images = extractPDFImages(ctx, pdfPath, logf)
+		images = extractPDFImages(ctx, pdfPath, opts, logf)
 	}
 	return p.processFootnotes(extracted, opts), images, 0
 }
@@ -730,7 +758,7 @@ func pdfPageCount(ctx context.Context, pdfPath string) int {
 // extractPDFTextOCR renders each PDF page to an image, runs OCR, and detects
 // figures via Vision observation bounding boxes.
 // Returns the full text, any cropped figure images, and the page count.
-func (p *DocumentProcessor) extractPDFTextOCR(ctx context.Context, pdfPath string, logf func(string, ...any)) (string, []PDFImage, int) {
+func (p *DocumentProcessor) extractPDFTextOCR(ctx context.Context, pdfPath string, opts ProcessOptions, logf func(string, ...any)) (string, []PDFImage, int) {
 	pageCount := pdfPageCount(ctx, pdfPath)
 	if pageCount == 0 {
 		return "", nil, 0
@@ -746,8 +774,22 @@ func (p *DocumentProcessor) extractPDFTextOCR(ctx context.Context, pdfPath strin
 	// Render all pages in a single pdftoppm call (batch mode) instead of
 	// one process per page. This reduces process spawn overhead significantly
 	// for large PDFs.
+	firstPage := 1
+	lastPage := pageCount
+	if opts.PageFrom > 0 {
+		firstPage = min(opts.PageFrom, pageCount)
+	}
+	if opts.PageTo > 0 && opts.PageTo <= pageCount {
+		lastPage = opts.PageTo
+	}
+	if firstPage > lastPage {
+		logf("Invalid page range %d–%d (PDF has %d pages)", firstPage, lastPage, pageCount)
+		return "", nil, 0
+	}
+	actualPages := lastPage - firstPage + 1
+	logf("Rendering %d pages (%d–%d) at 300 dpi…", actualPages, firstPage, lastPage)
 	batchCmd := exec.CommandContext(ctx, "pdftoppm", "-r", "300", "-png",
-		"-f", "1", "-l", strconv.Itoa(pageCount),
+		"-f", strconv.Itoa(firstPage), "-l", strconv.Itoa(lastPage),
 		pdfPath, filepath.Join(tmpDir, "page"))
 	if out, err := batchCmd.CombinedOutput(); err != nil {
 		errors.LogError(err, "extractPDFTextOCR: batch pdftoppm failed: %s", string(out))
@@ -761,28 +803,29 @@ func (p *DocumentProcessor) extractPDFTextOCR(ctx context.Context, pdfPath strin
 		text string
 		figs []PDFImage
 	}
-	results := make([]pageResult, pageCount)
+	results := make([]pageResult, actualPages)
 	var wg sync.WaitGroup
 
 	// pdftoppm zero-pads page numbers based on total page count:
 	// 1-9 pages → 1 digit, 10-99 → 2 digits, 100-999 → 3 digits, etc.
 	padWidth := len(strconv.Itoa(pageCount))
 
-	for i := range pageCount {
+	for i := range actualPages {
 		wg.Add(1)
 		go func(page int) {
 			defer wg.Done()
+			pdfPage := firstPage + page
 			select {
 			case ocrSem <- struct{}{}:
 			case <-ctx.Done():
-				logf("OCR page %d/%d: cancelled (%v)", page+1, pageCount, ctx.Err())
+				logf("OCR page %d/%d: cancelled (%v)", pdfPage, lastPage, ctx.Err())
 				return
 			}
 			defer func() { <-ocrSem }()
 
-			imgPath := filepath.Join(tmpDir, fmt.Sprintf("page-%0*d.png", padWidth, page+1))
+			imgPath := filepath.Join(tmpDir, fmt.Sprintf("page-%0*d.png", padWidth, pdfPage))
 			if _, statErr := os.Stat(imgPath); statErr != nil {
-				logf("OCR page %d/%d: rendered image not found", page+1, pageCount)
+				logf("OCR page %d/%d: rendered image not found", pdfPage, lastPage)
 				return
 			}
 
@@ -800,11 +843,11 @@ func (p *DocumentProcessor) extractPDFTextOCR(ctx context.Context, pdfPath strin
 				}
 				usedLang = "vision:" + lang
 				pageText = vr.Text
-				pageFigs = cropFigures(imgPath, vr.Obs, page+1)
+				pageFigs = cropFigures(imgPath, vr.Obs, pdfPage)
 				if len(pageFigs) > 0 {
-					logf("OCR page %d/%d engine=%s figures=%d", page+1, pageCount, usedLang, len(pageFigs))
+					logf("OCR page %d/%d engine=%s figures=%d", pdfPage, lastPage, usedLang, len(pageFigs))
 				} else {
-					logf("OCR page %d/%d engine=%s", page+1, pageCount, usedLang)
+					logf("OCR page %d/%d engine=%s", pdfPage, lastPage, usedLang)
 				}
 				break
 			}
@@ -815,7 +858,7 @@ func (p *DocumentProcessor) extractPDFTextOCR(ctx context.Context, pdfPath strin
 					usedLang = "tesseract:" + lang
 					pageText = t
 				}
-				logf("OCR page %d/%d engine=%s", page+1, pageCount, usedLang)
+				logf("OCR page %d/%d engine=%s", pdfPage, lastPage, usedLang)
 			}
 
 			metrics.RecordOCRCall()
@@ -832,7 +875,7 @@ func (p *DocumentProcessor) extractPDFTextOCR(ctx context.Context, pdfPath strin
 		allText.WriteString("\f") // page separator — enables processFootnotes per-page
 		allFigs = append(allFigs, r.figs...)
 	}
-	return allText.String(), allFigs, pageCount
+	return allText.String(), allFigs, actualPages
 }
 
 func (p *DocumentProcessor) processFootnotes(text string, opts ProcessOptions) string {

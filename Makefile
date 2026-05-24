@@ -2,8 +2,8 @@ BIN := bin/epublic8
 
 # Build variables - can be overridden at build time
 VERSION ?= dev
-COMMIT ?= unknown
-BUILD_TIME ?= unknown
+COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
 LDFLAGS := -ldflags "-X epublic8/internal/handler.Version=$(VERSION) -X epublic8/internal/handler.Commit=$(COMMIT) -X epublic8/internal/handler.BuildTime=$(BUILD_TIME)"
 

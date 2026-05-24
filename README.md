@@ -4,7 +4,7 @@ A web-based PDF to EPUB converter with OCR support.
 
 ## Requirements
 
-- Go 1.25+
+- Go 1.26+
 - `poppler-utils` (pdftotext, pdftoppm, pdfimages)
 - `tesseract-ocr` (Linux) or macOS with Vision framework
 
@@ -49,7 +49,7 @@ Environment variables or `-config config.yaml`. Env vars take precedence.
 
 ### How it works
 
-1. Upload via web UI
+1. Upload via web UI (max 250 MB). Optional page range to process a subset of pages.
 2. Text extraction via `pdftotext`. Falls back to OCR if garbled CE-encoded fonts detected.
 3. On macOS: Vision OCR with figure detection. On Linux: Tesseract (no figures).
 4. Chapter splitting on headings (`Glava`, `Poglavlje`, `Chapter`, Roman numerals) or word count.

@@ -19,6 +19,7 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -274,7 +275,7 @@ func (h *WebHandler) handleVersion(w http.ResponseWriter, _ *http.Request) {
 	json.NewEncoder(w).Encode(info)
 }
 
-func (h *WebHandler) serveUploadPage(w http.ResponseWriter, r *http.Request) {
+func (h *WebHandler) serveUploadPage(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
 	if err := h.templates.Execute(w, nil); err != nil {
 		errors.LogWarn("template execute error: %v", err)
@@ -330,7 +331,7 @@ func (h *WebHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, 200<<20) // 200 MB limit
+	r.Body = http.MaxBytesReader(w, r.Body, 250<<20) // 250 MB limit
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -436,12 +437,26 @@ func (h *WebHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		err error
 	}
 	resCh := make(chan procResult, 1)
+	pageFrom, _ := strconv.Atoi(r.FormValue("page_from"))
+	pageTo, _ := strconv.Atoi(r.FormValue("page_to"))
+	if pageFrom < 0 {
+		pageFrom = 0
+	}
+	if pageTo < 0 {
+		pageTo = 0
+	}
+	if pageFrom > 0 && pageTo > 0 && pageFrom > pageTo {
+		sendEvent("error", "page_from must be ≤ page_to")
+		return
+	}
 	opts := model.ProcessOptions{
 		SmartOCR:       r.FormValue("smart_ocr") == "true",
 		ForceOCR:       r.FormValue("force_ocr") == "true",
 		StripHeaders:   r.FormValue("strip_headers") != "false",
 		StripFootnotes: r.FormValue("strip_footnotes") != "false",
 		TextOnly:       r.FormValue("text_only") == "true",
+		PageFrom:       pageFrom,
+		PageTo:         pageTo,
 	}
 
 	goroutineTookOwnership = true
@@ -468,7 +483,7 @@ func (h *WebHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		if res.err != nil {
 			metrics.RecordDocumentProcessed(false)
 			logf("Processing error: %v", res.err)
-			sendEvent("error", res.err.Error())
+			sendEvent("error", sanitizeErrorMessage(res.err.Error()))
 			return
 		}
 		docResult = res.doc
@@ -488,7 +503,7 @@ func (h *WebHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		metrics.RecordDocumentProcessed(false)
 		logf("EPUB generation error: %v", err)
-		sendEvent("error", err.Error())
+		sendEvent("error", sanitizeErrorMessage(err.Error()))
 		return
 	}
 	logf("EPUB: %d chapters", len(epubResult.Chapters))
@@ -507,7 +522,7 @@ func (h *WebHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		if removeErr := os.Remove(epubPath); removeErr != nil && !os.IsNotExist(removeErr) {
 			errors.LogWarn("failed to remove partial EPUB %s: %v", epubPath, removeErr)
 		}
-		sendEvent("error", err.Error())
+		sendEvent("error", sanitizeErrorMessage(err.Error()))
 		return
 	}
 
@@ -543,8 +558,16 @@ func (h *WebHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	metrics.RecordDocumentProcessed(true)
+	sseMu.Lock()
 	fmt.Fprintf(w, "data: %s\n\n", doneJSON)
 	flusher.Flush()
+	sseMu.Unlock()
+}
+
+var tempPathRe = regexp.MustCompile(`(?:/tmp|/var/folders)/\S+`)
+
+func sanitizeErrorMessage(msg string) string {
+	return tempPathRe.ReplaceAllString(msg, "<redacted>")
 }
 
 // sanitizeFilename strips directory components from name and replaces any
