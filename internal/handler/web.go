@@ -61,10 +61,11 @@ type WebHandler struct {
 	templates       *template.Template
 	securityCfg     config.SecurityConfig
 	metricsCfg      config.MetricsConfig
-	uploadLimiters  sync.Map      // map[string]*rate.Limiter, keyed by remote IP
-	limiterStopCh   chan struct{} // closed by Close() to stop the pruning goroutine
-	closeOnce       sync.Once     // ensures Close() is idempotent
-	authHandler     http.Handler  // pre-built auth-wrapped handler; nil if no auth configured
+	uploadLimiters  sync.Map              // map[string]*rate.Limiter, keyed by remote IP
+	limiterStopCh   chan struct{}          // closed by Close() to stop the pruning goroutine
+	closeOnce       sync.Once             // ensures Close() is idempotent
+	authHandler     http.Handler          // pre-built auth-wrapped handler; nil if no auth configured
+	profileStore    *model.ProfileStore   // nil when profiles disabled (ephemeral output dir)
 }
 
 //go:embed templates
@@ -108,6 +109,17 @@ func NewWebHandler(docHandler *DocumentHandler, outputDir string, securityCfg co
 
 	epubGen := model.NewEPUBGenerator(chapterWords)
 
+	var profileStore *model.ProfileStore
+	if persistent {
+		profileDir := filepath.Join(outputDir, "profiles")
+		ps, psErr := model.NewProfileStore(profileDir)
+		if psErr != nil {
+			errors.LogWarn("profile store disabled: %v", psErr)
+		} else {
+			profileStore = ps
+		}
+	}
+
 	h := &WebHandler{
 		documentHandler: docHandler,
 		epubGenerator:   epubGen,
@@ -120,6 +132,7 @@ func NewWebHandler(docHandler *DocumentHandler, outputDir string, securityCfg co
 		limiterStopCh:   make(chan struct{}),
 		closeOnce:       sync.Once{},
 		authHandler:     nil,
+		profileStore:    profileStore,
 	}
 	if securityCfg.BasicAuth != "" {
 		h.authHandler = middleware.BasicAuth(&h.securityCfg, http.HandlerFunc(h.servePath))
@@ -151,8 +164,9 @@ func (h *WebHandler) pruneLimiters() {
 
 // protectedPaths are endpoints that require authentication when configured.
 var protectedPaths = map[string]bool{
-	"/api/upload": true,
-	"/download":   true,
+	"/api/upload":  true,
+	"/api/analyze": true,
+	"/download":    true,
 }
 
 func (h *WebHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -201,6 +215,8 @@ func (h *WebHandler) servePath(w http.ResponseWriter, r *http.Request) {
 		h.serveUploadPage(w, r)
 	case "/api/upload":
 		h.handleUpload(w, r)
+	case "/api/analyze":
+		h.handleAnalyze(w, r)
 	case "/download":
 		h.handleDownload(w, r)
 	case "/health/live":
@@ -331,7 +347,7 @@ func (h *WebHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, 250<<20) // 250 MB limit
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<30) // 1 GB limit
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -449,14 +465,30 @@ func (h *WebHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		sendEvent("error", "page_from must be ≤ page_to")
 		return
 	}
+	var includeClusters []int
+	var clusterDefs []model.FontCluster
+	if raw := r.FormValue("include_clusters"); raw != "" {
+		for _, s := range strings.Split(raw, ",") {
+			if id, err := strconv.Atoi(strings.TrimSpace(s)); err == nil {
+				includeClusters = append(includeClusters, id)
+			}
+		}
+	}
+	if raw := r.FormValue("cluster_defs"); raw != "" {
+		_ = json.Unmarshal([]byte(raw), &clusterDefs)
+	}
+
 	opts := model.ProcessOptions{
-		SmartOCR:       r.FormValue("smart_ocr") == "true",
-		ForceOCR:       r.FormValue("force_ocr") == "true",
-		StripHeaders:   r.FormValue("strip_headers") != "false",
-		StripFootnotes: r.FormValue("strip_footnotes") != "false",
-		TextOnly:       r.FormValue("text_only") == "true",
-		PageFrom:       pageFrom,
-		PageTo:         pageTo,
+		SmartOCR:        r.FormValue("smart_ocr") == "true",
+		ForceOCR:        r.FormValue("force_ocr") == "true",
+		StripHeaders:    r.FormValue("strip_headers") != "false",
+		StripFootnotes:  r.FormValue("strip_footnotes") != "false",
+		StripCaptions:   r.FormValue("strip_captions") == "true",
+		IncludeClusters: includeClusters,
+		ClusterDefs:     clusterDefs,
+		TextOnly:        r.FormValue("text_only") == "true",
+		PageFrom:        pageFrom,
+		PageTo:          pageTo,
 	}
 
 	goroutineTookOwnership = true
@@ -558,6 +590,27 @@ func (h *WebHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	metrics.RecordDocumentProcessed(true)
+
+	// Auto-save profile when cluster-based filtering was used.
+	if fp := r.FormValue("fingerprint"); fp != "" && h.profileStore != nil && len(includeClusters) > 0 {
+		profile := model.Profile{
+			Fingerprint: fp,
+			Title:       r.FormValue("profile_title"),
+			Clusters:    clusterDefs,
+			SelectedIDs: includeClusters,
+			CreatedAt:   time.Now(),
+			LastUsedAt:  time.Now(),
+		}
+		if profile.Title == "" {
+			profile.Title = filename
+		}
+		if err := h.profileStore.Save(profile); err != nil {
+			logf("Profile save failed: %v", err)
+		} else {
+			logf("Profile saved: %s", profile.Title)
+		}
+	}
+
 	sseMu.Lock()
 	fmt.Fprintf(w, "data: %s\n\n", doneJSON)
 	flusher.Flush()

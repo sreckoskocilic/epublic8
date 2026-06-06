@@ -145,7 +145,10 @@ type ProcessOptions struct {
 	ForceOCR       bool // always render pages via OCR, skip embedded text entirely
 	StripHeaders   bool // remove running headers from paginated PDFs
 	StripFootnotes bool // strip footnote sections from page bottoms
-	TextOnly       bool // skip embedded image extraction
+	StripCaptions   bool          // remove art image descriptions and sidebar notes (e.g. LIFELINE)
+	IncludeClusters []int         // cluster IDs to include; nil = no cluster filtering
+	ClusterDefs     []FontCluster // cluster definitions from analyze step
+	TextOnly        bool          // skip embedded image extraction
 	PageFrom       int  // first page to process (1-based, 0 = start)
 	PageTo         int  // last page to process (1-based, 0 = end)
 }
@@ -154,13 +157,16 @@ type ProcessOptions struct {
 // footnotes stripped, images extracted, force-OCR off.
 func DefaultProcessOptions() ProcessOptions {
 	return ProcessOptions{
-		SmartOCR:       true,
-		StripHeaders:   true,
-		StripFootnotes: true,
-		ForceOCR:       false,
-		TextOnly:       false,
-		PageFrom:       0,
-		PageTo:         0,
+		SmartOCR:        true,
+		StripHeaders:    true,
+		StripFootnotes:  true,
+		ForceOCR:        false,
+		StripCaptions:   false,
+		IncludeClusters: nil,
+		ClusterDefs:     nil,
+		TextOnly:        false,
+		PageFrom:        0,
+		PageTo:          0,
 	}
 }
 
@@ -548,6 +554,10 @@ func parsePDFFonts(ctx context.Context, pdfPath string) (hasUnmapped, likelyScan
 		}
 	}
 	likelyScan = total > 0 && scan == total
+	// Single font of any kind = likely OCR layer (real books use multiple fonts).
+	if !likelyScan && total == 1 {
+		likelyScan = true
+	}
 	return hasUnmapped, likelyScan
 }
 
@@ -566,6 +576,11 @@ func (p *DocumentProcessor) extractPDFTextFromPath(ctx context.Context, pdfPath 
 
 	if opts.ForceOCR {
 		logf("Force OCR enabled, skipping embedded text")
+		return runOCR()
+	}
+
+	if len(opts.IncludeClusters) > 0 && len(opts.ClusterDefs) > 0 {
+		logf("Cluster filtering enabled, using OCR for bounding-box data")
 		return runOCR()
 	}
 
@@ -755,6 +770,161 @@ func pdfPageCount(ctx context.Context, pdfPath string) int {
 	return 0
 }
 
+// AnalyzePDF samples evenly-spaced pages from a PDF, runs Vision OCR, and
+// clusters the observations by font size. Returns a ClusterResult for the
+// frontend to display. Requires Vision OCR (macOS).
+func (p *DocumentProcessor) AnalyzePDF(ctx context.Context, pdfPath string, pageFrom, pageTo int, logf func(string, ...any)) (*ClusterResult, error) {
+	visionOCROnce.Do(initVisionOCR)
+	if visionOCRBin == "" {
+		return nil, fmt.Errorf("vision OCR not available (macOS only)")
+	}
+
+	pageCount := pdfPageCount(ctx, pdfPath)
+	if pageCount == 0 {
+		return nil, fmt.Errorf("could not determine page count")
+	}
+
+	rangeStart := 1
+	rangeEnd := pageCount
+	if pageFrom > 0 && pageFrom <= pageCount {
+		rangeStart = pageFrom
+	}
+	if pageTo > 0 && pageTo <= pageCount {
+		rangeEnd = pageTo
+	}
+	rangeLen := rangeEnd - rangeStart + 1
+	if rangeLen <= 0 {
+		return nil, fmt.Errorf("invalid page range %d–%d", pageFrom, pageTo)
+	}
+
+	const maxSamplePages = 20
+	samplePages := pickSamplePages(rangeLen, maxSamplePages)
+	for i := range samplePages {
+		samplePages[i] += rangeStart - 1
+	}
+	logf("Analyzing %d sample pages from range %d–%d (total %d)", len(samplePages), rangeStart, rangeEnd, pageCount)
+
+	tmpDir, err := os.MkdirTemp("", "pdf_analyze_*")
+	if err != nil {
+		return nil, fmt.Errorf("create temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	langs := p.OCRLanguages
+	if len(langs) == 0 {
+		langs = []string{"eng"}
+	}
+
+	type analyzePageResult struct {
+		obs     []visionObs
+		pageNum int
+	}
+	results := make([]analyzePageResult, len(samplePages))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, runtime.GOMAXPROCS(0))
+
+	for idx, pg := range samplePages {
+		wg.Add(1)
+		go func(i, pageNum int) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-sem }()
+
+			imgPrefix := filepath.Join(tmpDir, fmt.Sprintf("p%d", pageNum))
+			cmd := exec.CommandContext(ctx, "pdftoppm", "-r", "150", "-png",
+				"-f", strconv.Itoa(pageNum), "-l", strconv.Itoa(pageNum), "-singlefile",
+				pdfPath, imgPrefix)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				logf("Analyze: render page %d failed: %s", pageNum, string(out))
+				return
+			}
+			imgPath := imgPrefix + ".png"
+			defer os.Remove(imgPath)
+			if _, err := os.Stat(imgPath); err != nil {
+				return
+			}
+
+			for _, lang := range langs {
+				vr := runVisionOCR(ctx, imgPath, lang)
+				if len(vr.Obs) > 0 {
+					results[i] = analyzePageResult{obs: vr.Obs, pageNum: pageNum}
+					logf("Analyze: page %d → %d observations", pageNum, len(vr.Obs))
+					return
+				}
+			}
+		}(idx, pg)
+	}
+	wg.Wait()
+
+	var allObs [][]visionObs
+	var obsPageNums []int
+	for _, r := range results {
+		if len(r.obs) > 0 {
+			allObs = append(allObs, r.obs)
+			obsPageNums = append(obsPageNums, r.pageNum)
+		}
+	}
+
+	if len(allObs) == 0 {
+		return nil, fmt.Errorf("no observations from sampled pages")
+	}
+
+	var totalObs int
+	var minH, maxH float64
+	for _, pageObs := range allObs {
+		for _, o := range pageObs {
+			if o.H <= 0 {
+				continue
+			}
+			totalObs++
+			if minH == 0 || o.H < minH {
+				minH = o.H
+			}
+			if o.H > maxH {
+				maxH = o.H
+			}
+		}
+	}
+	logf("Analyze: %d total obs, H range [%.4f – %.4f], ratio %.1fx", totalObs, minH, maxH, maxH/minH)
+
+	result := ClusterObservations(allObs, obsPageNums)
+	result.PageCount = pageCount
+	logf("Analyze: %d clusters detected", len(result.Clusters))
+	for _, c := range result.Clusters {
+		logf("  Cluster %d (%s): %d lines, avgH=%.4f [%.4f–%.4f]", c.ID, c.RelativeSize, c.LineCount, c.AvgH, c.MinH, c.MaxH)
+	}
+	return &result, nil
+}
+
+// pickSamplePages returns up to n evenly-spaced page numbers from [1, total].
+func pickSamplePages(total, n int) []int {
+	if total <= n {
+		pages := make([]int, total)
+		for i := range pages {
+			pages[i] = i + 1
+		}
+		return pages
+	}
+	pages := make([]int, n)
+	for i := range n {
+		pages[i] = 1 + i*(total-1)/(n-1)
+	}
+	// Deduplicate (can happen with small totals).
+	seen := map[int]bool{}
+	var unique []int
+	for _, p := range pages {
+		if !seen[p] {
+			seen[p] = true
+			unique = append(unique, p)
+		}
+	}
+	return unique
+}
+
 // extractPDFTextOCR renders each PDF page to an image, runs OCR, and detects
 // figures via Vision observation bounding boxes.
 // Returns the full text, any cropped figure images, and the page count.
@@ -787,8 +957,12 @@ func (p *DocumentProcessor) extractPDFTextOCR(ctx context.Context, pdfPath strin
 		return "", nil, 0
 	}
 	actualPages := lastPage - firstPage + 1
-	logf("Rendering %d pages (%d–%d) at 300 dpi…", actualPages, firstPage, lastPage)
-	batchCmd := exec.CommandContext(ctx, "pdftoppm", "-r", "300", "-png",
+	renderDPI := "300"
+	if len(opts.IncludeClusters) > 0 {
+		renderDPI = "150"
+	}
+	logf("Rendering %d pages (%d–%d) at %s dpi…", actualPages, firstPage, lastPage, renderDPI)
+	batchCmd := exec.CommandContext(ctx, "pdftoppm", "-r", renderDPI, "-png",
 		"-f", strconv.Itoa(firstPage), "-l", strconv.Itoa(lastPage),
 		pdfPath, filepath.Join(tmpDir, "page"))
 	if out, err := batchCmd.CombinedOutput(); err != nil {
@@ -843,6 +1017,11 @@ func (p *DocumentProcessor) extractPDFTextOCR(ctx context.Context, pdfPath strin
 				}
 				usedLang = "vision:" + lang
 				pageText = vr.Text
+				if len(opts.IncludeClusters) > 0 && len(opts.ClusterDefs) > 0 {
+					pageText, _ = FilterObsByCluster(pageText, vr.Obs, opts.IncludeClusters, opts.ClusterDefs)
+				} else if opts.StripCaptions {
+					pageText = filterSmallFontText(pageText, vr.Obs)
+				}
 				pageFigs = cropFigures(imgPath, vr.Obs, pdfPage)
 				if len(pageFigs) > 0 {
 					logf("OCR page %d/%d engine=%s figures=%d", pdfPage, lastPage, usedLang, len(pageFigs))
@@ -887,13 +1066,23 @@ func (p *DocumentProcessor) processFootnotes(text string, opts ProcessOptions) s
 		return text
 	}
 	pages := strings.Split(text, "\f")
+
+	// Detect repeated headers/footers across pages before stripping.
+	var headers, footers map[string]bool
+	if opts.StripHeaders && len(pages) > 2 {
+		headers, footers = detectRepeatingHeadersFooters(pages[1:])
+	}
+
 	processed := make([]string, 0, len(pages))
 	for i, page := range pages {
 		if i > 0 && opts.StripHeaders {
-			page = stripRunningHeader(page)
+			page = stripDetectedHeaders(page, headers, footers)
 		}
 		if opts.StripFootnotes {
 			page = p.processPageFootnotes(page)
+		}
+		if opts.StripCaptions {
+			page = stripLifelineNotes(page)
 		}
 		processed = append(processed, page)
 	}
@@ -903,113 +1092,138 @@ func (p *DocumentProcessor) processFootnotes(text string, opts ProcessOptions) s
 // pageNumOnlyRe matches a block that is just a page number.
 var pageNumOnlyRe = regexp.MustCompile(`^\d+$`)
 
-// stripRunningHeader removes the running header (page number + repeated title
-// words) from the start of a page. It handles two formats:
-//
-//   - pdftotext pages: blank-line-separated blocks; looks for a standalone
-//     page number within the first few blocks as a signal, then strips leading
-//     short all-caps blocks.
-//
-//   - OCR pages (Vision/Tesseract): single-newline-separated lines; strips
-//     leading lines that are short, mostly uppercase, and contain a digit
-//     (the page number is typically embedded in the header line, e.g.
-//     "2 MYTH AND REALITY" or "THE STRUCTURE OF MYTHS 3").
-func stripRunningHeader(page string) string {
-	blocks := strings.Split(page, "\n\n")
+// detectRepeatingHeadersFooters scans the top and bottom of each page to find
+// text that repeats across many pages. Repeated text at the top = running header,
+// at the bottom = running footer. No assumptions about case or formatting.
+func detectRepeatingHeadersFooters(pages []string) (headers, footers map[string]bool) {
+	const maxTopBlocks = 5
+	const maxBottomBlocks = 3
+	const minPages = 3
 
-	// Scan the first few blocks for a bare page number.
-	const lookAhead = 8
-	limit := lookAhead
-	if limit > len(blocks) {
-		limit = len(blocks)
-	}
-	hasPageNum := false
-	for _, b := range blocks[:limit] {
-		if pageNumOnlyRe.MatchString(strings.TrimSpace(b)) {
-			hasPageNum = true
-			break
-		}
-	}
-	if hasPageNum {
-		// pdftotext format: consume leading blocks that are either the page
-		// number or short all-uppercase header words (book/chapter title fragments).
-		i := 0
-		for i < len(blocks) {
-			trimmed := strings.TrimSpace(blocks[i])
-			if trimmed == "" {
-				i++
-				continue
-			}
-			if pageNumOnlyRe.MatchString(trimmed) {
-				i++
-				continue
-			}
-			// Short block whose letters are overwhelmingly uppercase → header word.
-			words := strings.Fields(trimmed)
-			if len(words) <= 4 && headerUppercase(trimmed) {
-				i++
-				continue
-			}
-			break
-		}
-		return strings.Join(blocks[i:], "\n\n")
-	}
+	topCounts := map[string]int{}
+	bottomCounts := map[string]int{}
 
-	// OCR format: no blank-line separators. Check the first few single-newline
-	// lines for running-header patterns: short + mostly uppercase + contains a
-	// digit (the page number is on the same line as the title, e.g.
-	// "2 MYTH AND REALITY" or "THE STRUCTURE OF MYTHS 3").
-	lines := strings.Split(page, "\n")
-	const maxOCRHeaderLines = 4
-	i := 0
-	for i < len(lines) && i < maxOCRHeaderLines {
-		trimmed := strings.TrimSpace(lines[i])
-		if trimmed == "" {
-			i++
+	for _, page := range pages {
+		blocks := nonEmptyBlocks(page)
+		if len(blocks) == 0 {
 			continue
 		}
-		words := strings.Fields(trimmed)
-		if len(words) <= 6 && headerUppercase(trimmed) && stringContainsDigit(trimmed) {
-			i++
-			continue
+
+		topLimit := maxTopBlocks
+		if topLimit > len(blocks) {
+			topLimit = len(blocks)
 		}
-		// Also strip a bare page-number line at the very top.
-		if pageNumOnlyRe.MatchString(trimmed) {
-			i++
+		seen := map[string]bool{}
+		for _, b := range blocks[:topLimit] {
+			norm := strings.TrimSpace(b)
+			if norm == "" || pageNumOnlyRe.MatchString(norm) {
+				continue
+			}
+			if !seen[norm] {
+				topCounts[norm]++
+				seen[norm] = true
+			}
+		}
+
+		bottomLimit := maxBottomBlocks
+		if bottomLimit > len(blocks) {
+			bottomLimit = len(blocks)
+		}
+		seen = map[string]bool{}
+		for _, b := range blocks[len(blocks)-bottomLimit:] {
+			norm := strings.TrimSpace(b)
+			if norm == "" || pageNumOnlyRe.MatchString(norm) {
+				continue
+			}
+			if !seen[norm] {
+				bottomCounts[norm]++
+				seen[norm] = true
+			}
+		}
+	}
+
+	threshold := len(pages) * 30 / 100
+	if threshold < minPages {
+		threshold = minPages
+	}
+
+	headers = map[string]bool{}
+	for text, count := range topCounts {
+		if count >= threshold {
+			headers[text] = true
+		}
+	}
+	footers = map[string]bool{}
+	for text, count := range bottomCounts {
+		if count >= threshold {
+			footers[text] = true
+		}
+	}
+	return headers, footers
+}
+
+// nonEmptyBlocks splits a page into blank-line-separated blocks (pdftotext style)
+// or single-newline lines (OCR style) and returns non-empty entries.
+func nonEmptyBlocks(page string) []string {
+	var blocks []string
+	if strings.Contains(page, "\n\n") {
+		for _, b := range strings.Split(page, "\n\n") {
+			if strings.TrimSpace(b) != "" {
+				blocks = append(blocks, strings.TrimSpace(b))
+			}
+		}
+	} else {
+		for _, l := range strings.Split(page, "\n") {
+			if strings.TrimSpace(l) != "" {
+				blocks = append(blocks, strings.TrimSpace(l))
+			}
+		}
+	}
+	return blocks
+}
+
+// stripDetectedHeaders removes known repeated headers/footers and bare page
+// numbers from a page.
+func stripDetectedHeaders(page string, headers, footers map[string]bool) string {
+	blocks := nonEmptyBlocks(page)
+	if len(blocks) == 0 {
+		return page
+	}
+
+	// Determine separator style.
+	sep := "\n"
+	if strings.Contains(page, "\n\n") {
+		sep = "\n\n"
+	}
+
+	// Strip from top: page numbers and detected headers.
+	start := 0
+	for start < len(blocks) {
+		b := blocks[start]
+		if pageNumOnlyRe.MatchString(b) || headers[b] {
+			start++
 			continue
 		}
 		break
 	}
-	if i == 0 {
+
+	// Strip from bottom: page numbers and detected footers.
+	end := len(blocks)
+	for end > start {
+		b := blocks[end-1]
+		if pageNumOnlyRe.MatchString(b) || footers[b] {
+			end--
+			continue
+		}
+		break
+	}
+
+	if start == 0 && end == len(blocks) {
 		return page
 	}
-	return strings.Join(lines[i:], "\n")
+	return strings.Join(blocks[start:end], sep)
 }
 
-// stringContainsDigit returns true if s contains at least one ASCII digit.
-func stringContainsDigit(s string) bool {
-	for _, c := range s {
-		if c >= '0' && c <= '9' {
-			return true
-		}
-	}
-	return false
-}
-
-// headerUppercase reports whether at least 80% of the ASCII letters in s are
-// uppercase — the threshold that distinguishes "MYTH" from "mythos came in…".
-func headerUppercase(s string) bool {
-	var letters, upper int
-	for _, c := range s {
-		if c >= 'a' && c <= 'z' {
-			letters++
-		} else if c >= 'A' && c <= 'Z' {
-			letters++
-			upper++
-		}
-	}
-	return letters > 0 && float64(upper)/float64(letters) >= 0.8
-}
 
 func (p *DocumentProcessor) processPageFootnotes(text string) string {
 	lines := strings.Split(text, "\n")

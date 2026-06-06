@@ -108,7 +108,7 @@ func main() {
 	httpServer := &http.Server{
 		Addr:              ":" + cfg.Server.HTTPPort,
 		Handler:           metrics.Middleware(cfg.Metrics.Path, http.HandlerFunc(webHandler.ServeHTTP)),
-		ReadTimeout:       60 * time.Second,
+		ReadTimeout:       10 * time.Minute,
 		ReadHeaderTimeout: 10 * time.Second,
 		WriteTimeout:      15 * time.Minute,
 		IdleTimeout:       120 * time.Second,

@@ -248,6 +248,38 @@
         }
         .download-btn:hover { opacity: 0.88; }
 
+        /* ── Cluster selection panel ── */
+        .cluster-panel { display: none; margin-bottom: 14px; }
+        .cluster-panel.visible { display: block; }
+        .cluster-panel-title { font-size: 13px; font-weight: 600; color: #333; margin-bottom: 8px; }
+        .profile-banner {
+            background: #e8f5e9; border: 1px solid #a5d6a7; border-radius: 6px;
+            padding: 8px 12px; font-size: 12px; color: #2e7d32; margin-bottom: 10px;
+        }
+        .cluster-grid { display: flex; flex-direction: column; gap: 8px; }
+        .cluster-card {
+            display: flex; align-items: flex-start; gap: 10px;
+            border: 1px solid #e0e0e0; border-radius: 8px; padding: 10px 12px;
+            cursor: pointer; transition: border-color 0.15s, background 0.15s;
+        }
+        .cluster-card:hover { border-color: #667eea; background: #fafafe; }
+        .cluster-card.selected { border-color: #667eea; background: #f6f7ff; }
+        .cluster-card input[type="checkbox"] { margin-top: 3px; accent-color: #667eea; flex-shrink: 0; }
+        .cluster-info { flex: 1; min-width: 0; }
+        .cluster-label { font-size: 13px; font-weight: 600; color: #333; }
+        .cluster-meta { font-size: 11px; color: #999; margin-top: 2px; }
+        .cluster-samples {
+            font-size: 11px; color: #666; margin-top: 4px;
+            max-height: 60px; overflow-y: auto; line-height: 1.5;
+            font-family: 'Courier New', monospace;
+        }
+        .cluster-bar-wrap { width: 50px; flex-shrink: 0; display: flex; align-items: center; height: 20px; }
+        .cluster-bar { height: 100%; background: #667eea; border-radius: 2px; min-width: 4px; }
+        .analyze-btn {
+            background: linear-gradient(135deg, #43a047 0%, #2e7d32 100%);
+            margin-bottom: 8px;
+        }
+
         @media (max-width: 680px) {
             .page { flex-direction: column; }
             .right { width: 100%; }
@@ -259,7 +291,7 @@
         <div class="left">
             <div class="card">
                 <h1>Document to EPUB</h1>
-                <p class="subtitle">PDF, TXT, MD, HTML &middot; max 250 MB</p>
+                <p class="subtitle">PDF, TXT, MD, HTML &middot; max 1 GB</p>
 
                 <form id="uploadForm" enctype="multipart/form-data">
                     <!-- Drop zone -->
@@ -311,6 +343,10 @@
                             <span>Strip footnotes <span class="option-hint">&mdash; remove footnote sections at the bottom of pages</span></span>
                         </label>
                         <label class="option-row" style="margin-top:8px">
+                            <input type="checkbox" id="stripCaptions" name="strip_captions" value="true">
+                            <span>Strip image captions <span class="option-hint">&mdash; remove artwork descriptions (medium, dimensions, museum) and LIFELINE sidebars; useful for art books</span></span>
+                        </label>
+                        <label class="option-row" style="margin-top:8px">
                             <input type="checkbox" id="textOnly" name="text_only" value="true">
                             <span>Text only <span class="option-hint">&mdash; skip embedded image extraction; useful for scanned books with no real figures</span></span>
                         </label>
@@ -324,6 +360,17 @@
                         </label>
                     </div>
 
+                    <!-- Cluster selection (shown after PDF analysis) -->
+                    <div class="cluster-panel" id="clusterPanel">
+                        <div class="cluster-panel-title">Text layers detected</div>
+                        <div class="profile-banner" id="profileBanner" style="display:none"></div>
+                        <div class="cluster-grid" id="clusterGrid"></div>
+                    </div>
+
+                    <button type="button" class="analyze-btn" id="analyzeBtn" style="display:none" disabled>
+                        <span id="analyzeLabel">Analyze PDF</span>
+                        <span class="spinner"></span>
+                    </button>
                     <button type="submit" id="submitBtn" disabled>
                         <span id="submitLabel">Convert to EPUB</span>
                         <span class="spinner"></span>
@@ -370,10 +417,19 @@
         const timerEl     = document.getElementById('timer');
         const advToggle   = document.getElementById('advancedToggle');
         const advBody     = document.getElementById('advancedBody');
+        const analyzeBtn  = document.getElementById('analyzeBtn');
+        const analyzeLabel= document.getElementById('analyzeLabel');
+        const clusterPanel= document.getElementById('clusterPanel');
+        const clusterGrid = document.getElementById('clusterGrid');
+        const profileBanner = document.getElementById('profileBanner');
 
         let abortController = null;
         let timerInterval   = null;
         let dragDepth       = 0;
+
+        // Cluster analysis state
+        let analyzeData     = null; // { clusters, fingerprint, matched_profile }
+        let isPDF           = false;
 
         // ── Advanced toggle ──
         advToggle.addEventListener('click', () => {
@@ -408,7 +464,6 @@
         });
 
         function setFile(file) {
-            // Transfer to the hidden input when coming from drag-and-drop.
             if (fileInput.files[0] !== file) {
                 const dt = new DataTransfer();
                 dt.items.add(file);
@@ -417,8 +472,24 @@
             dzTitle.textContent = file.name;
             dzSub.textContent   = formatSize(file.size);
             dropZone.classList.add('has-file');
-            submitBtn.disabled = false;
             result.classList.remove('show');
+
+            isPDF = file.name.toLowerCase().endsWith('.pdf');
+            analyzeData = null;
+            clusterPanel.classList.remove('visible');
+            clusterGrid.innerHTML = '';
+            profileBanner.style.display = 'none';
+
+            if (isPDF) {
+                analyzeBtn.style.display = '';
+                analyzeBtn.disabled = false;
+                submitBtn.disabled = true;
+                submitBtn.style.display = 'none';
+            } else {
+                analyzeBtn.style.display = 'none';
+                submitBtn.style.display = '';
+                submitBtn.disabled = false;
+            }
         }
 
         function clearFile() {
@@ -427,6 +498,11 @@
             dzSub.textContent   = 'PDF, TXT, Markdown, HTML';
             dropZone.classList.remove('has-file');
             submitBtn.disabled = true;
+            submitBtn.style.display = '';
+            analyzeBtn.style.display = 'none';
+            analyzeData = null;
+            isPDF = false;
+            clusterPanel.classList.remove('visible');
         }
 
         function formatSize(bytes) {
@@ -457,10 +533,122 @@
             timerEl.textContent = '';
         }
 
+        // ── Analyze flow (PDFs only) ──
+        analyzeBtn.addEventListener('click', async () => {
+            if (!fileInput.files.length) return;
+            const formData = new FormData();
+            formData.append('file', fileInput.files[0]);
+            const pf = document.getElementById('pageFrom').value;
+            const pt = document.getElementById('pageTo').value;
+            if (pf) formData.append('page_from', pf);
+            if (pt) formData.append('page_to', pt);
+
+            analyzeBtn.disabled = true;
+            analyzeLabel.textContent = 'Analyzing…';
+            analyzeBtn.classList.add('loading');
+            result.classList.remove('show');
+
+            try {
+                const resp = await fetch('/api/analyze', { method: 'POST', body: formData });
+                if (!resp.ok) {
+                    const text = await resp.text();
+                    showResult('error', `Analysis failed: ${text.trim()}`);
+                    return;
+                }
+                analyzeData = await resp.json();
+                renderClusters(analyzeData);
+                analyzeBtn.style.display = 'none';
+                submitBtn.style.display = '';
+                submitBtn.disabled = false;
+                submitLabel.textContent = 'Convert to EPUB';
+            } catch (err) {
+                showResult('error', 'Analysis error: ' + err.message);
+            } finally {
+                analyzeBtn.classList.remove('loading');
+                analyzeBtn.disabled = false;
+                analyzeLabel.textContent = 'Analyze PDF';
+            }
+        });
+
+        function renderClusters(data) {
+            clusterGrid.innerHTML = '';
+            if (!data.clusters || data.clusters.length === 0) {
+                clusterPanel.classList.remove('visible');
+                return;
+            }
+
+            // Profile match banner
+            if (data.matched_profile) {
+                profileBanner.textContent = 'Matched profile: ' + data.matched_profile.title;
+                profileBanner.style.display = '';
+            } else {
+                profileBanner.style.display = 'none';
+            }
+
+            const preSelected = data.matched_profile ? new Set(data.matched_profile.selected_ids) : null;
+            const maxH = Math.max(...data.clusters.map(c => c.avg_h));
+
+            for (const cluster of data.clusters) {
+                const card = document.createElement('label');
+                card.className = 'cluster-card';
+                const checked = preSelected ? preSelected.has(cluster.id)
+                    : (cluster.relative_size === 'body' || cluster.relative_size === 'heading' || cluster.relative_size === 'subheading');
+                if (checked) card.classList.add('selected');
+
+                const cb = document.createElement('input');
+                cb.type = 'checkbox';
+                cb.checked = checked;
+                cb.dataset.clusterId = cluster.id;
+                cb.addEventListener('change', () => card.classList.toggle('selected', cb.checked));
+
+                const info = document.createElement('div');
+                info.className = 'cluster-info';
+
+                const sizeLabels = { heading: 'Heading', subheading: 'Subheading', body: 'Body text', caption: 'Caption', metadata: 'Metadata', running_header: 'Running header' };
+                const label = document.createElement('div');
+                label.className = 'cluster-label';
+                label.textContent = (sizeLabels[cluster.relative_size] || cluster.relative_size) + ' (ID ' + cluster.id + ')';
+
+                const meta = document.createElement('div');
+                meta.className = 'cluster-meta';
+                meta.textContent = cluster.line_count + ' lines · avg height ' + cluster.avg_h.toFixed(4);
+
+                const samples = document.createElement('div');
+                samples.className = 'cluster-samples';
+                samples.textContent = (cluster.sample_texts || []).join('\n');
+
+                info.appendChild(label);
+                info.appendChild(meta);
+                info.appendChild(samples);
+
+                const barWrap = document.createElement('div');
+                barWrap.className = 'cluster-bar-wrap';
+                const bar = document.createElement('div');
+                bar.className = 'cluster-bar';
+                bar.style.width = Math.round((cluster.avg_h / maxH) * 100) + '%';
+                barWrap.appendChild(bar);
+
+                card.appendChild(cb);
+                card.appendChild(info);
+                card.appendChild(barWrap);
+                clusterGrid.appendChild(card);
+            }
+
+            clusterPanel.classList.add('visible');
+        }
+
+        function getSelectedClusterIDs() {
+            const ids = [];
+            for (const cb of clusterGrid.querySelectorAll('input[type="checkbox"]')) {
+                if (cb.checked) ids.push(parseInt(cb.dataset.clusterId));
+            }
+            return ids;
+        }
+
         uploadForm.addEventListener('submit', async (e) => {
             e.preventDefault();
             if (!fileInput.files.length) { showResult('error', 'Please select a file'); return; }
-            if (fileInput.files[0].size > 250 * 1048576) { showResult('error', 'File exceeds 250\u00a0MB limit'); return; }
+            if (fileInput.files[0].size > 1073741824) { showResult('error', 'File exceeds 1\u00a0GB limit'); return; }
 
             const formData = new FormData();
             formData.append('file', fileInput.files[0]);
@@ -469,11 +657,18 @@
             formData.append('force_ocr', document.getElementById('forceOcr').checked ? 'true' : 'false');
             formData.append('strip_headers', document.getElementById('stripHeaders').checked ? 'true' : 'false');
             formData.append('strip_footnotes', document.getElementById('stripFootnotes').checked ? 'true' : 'false');
+            formData.append('strip_captions', document.getElementById('stripCaptions').checked ? 'true' : 'false');
             formData.append('text_only', document.getElementById('textOnly').checked ? 'true' : 'false');
             const pageFrom = document.getElementById('pageFrom').value;
             const pageTo = document.getElementById('pageTo').value;
             if (pageFrom) formData.append('page_from', pageFrom);
             if (pageTo) formData.append('page_to', pageTo);
+
+            if (analyzeData) {
+                formData.append('include_clusters', getSelectedClusterIDs().join(','));
+                formData.append('cluster_defs', JSON.stringify(analyzeData.clusters));
+                formData.append('fingerprint', analyzeData.fingerprint);
+            }
 
             abortController = new AbortController();
             uploadForm.classList.add('loading');

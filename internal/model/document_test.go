@@ -201,92 +201,73 @@ func TestDefaultProcessOptions(t *testing.T) {
 	}
 }
 
-// --- stringContainsDigit ---
+// --- detectRepeatingHeadersFooters ---
 
-func TestStringContainsDigit(t *testing.T) {
-	cases := []struct {
-		s    string
-		want bool
-	}{
-		{"abc", false},
-		{"abc1", true},
-		{"1", true},
-		{"", false},
-		{"page 5", true},
-		{"TITLE", false},
+func TestDetectRepeatingHeaders(t *testing.T) {
+	// Simulate 10 pages where "Strange Beginnings" repeats at top
+	pages := make([]string, 10)
+	for i := range pages {
+		pages[i] = fmt.Sprintf("Strange Beginnings\n\n%d\n\nFirst paragraph of page %d.\n\nSecond paragraph %d.\n\nThird paragraph %d.\n\nFourth paragraph %d.\n\nFifth paragraph %d.\n\nSixth ending %d.", i+20, i+1, i+1, i+1, i+1, i+1, i+1)
 	}
-	for _, tc := range cases {
-		if got := stringContainsDigit(tc.s); got != tc.want {
-			t.Errorf("stringContainsDigit(%q) = %v, want %v", tc.s, got, tc.want)
-		}
+	headers, footers := detectRepeatingHeadersFooters(pages)
+	if !headers["Strange Beginnings"] {
+		t.Errorf("expected 'Strange Beginnings' detected as header, got headers: %v", headers)
+	}
+	if len(footers) != 0 {
+		t.Errorf("expected no footers, got: %v", footers)
 	}
 }
 
-// --- headerUppercase ---
-
-func TestHeaderUppercase(t *testing.T) {
-	cases := []struct {
-		s    string
-		want bool
-	}{
-		{"MYTH", true},
-		{"myth", false},
-		{"MYTh", false}, // 75% uppercase — below threshold
-		{"MYTH AND REALITY", true},
-		{"Myth and reality", false},
-		{"2 MYTH AND REALITY", true}, // digits ignored, letters are all-caps
-		{"", false},
+func TestDetectRepeatingHeadersUppercase(t *testing.T) {
+	pages := make([]string, 10)
+	for i := range pages {
+		pages[i] = fmt.Sprintf("MYTH AND REALITY\n\n%d\n\nBody text page %d.", i+1, i+1)
 	}
-	for _, tc := range cases {
-		if got := headerUppercase(tc.s); got != tc.want {
-			t.Errorf("headerUppercase(%q) = %v, want %v", tc.s, got, tc.want)
-		}
+	headers, _ := detectRepeatingHeadersFooters(pages)
+	if !headers["MYTH AND REALITY"] {
+		t.Errorf("expected 'MYTH AND REALITY' detected as header, got: %v", headers)
 	}
 }
 
-// --- stripRunningHeader ---
+func TestDetectRepeatingHeadersNoRepetition(t *testing.T) {
+	pages := []string{
+		"Unique title one\n\n1\n\nFirst paragraph of body text.\n\nSecond paragraph.\n\nThird.",
+		"Different title\n\n2\n\nAnother body paragraph here.\n\nMore content.\n\nEnding.",
+		"Another heading\n\n3\n\nYet more content in this page.\n\nExtra text.\n\nDone.",
+		"Yet another\n\n4\n\nFinal page body content here.\n\nSome more.\n\nFinished.",
+	}
+	headers, footers := detectRepeatingHeadersFooters(pages)
+	if len(headers) != 0 {
+		t.Errorf("expected no headers detected, got: %v", headers)
+	}
+	if len(footers) != 0 {
+		t.Errorf("expected no footers, got: %v", footers)
+	}
+}
 
-func TestStripRunningHeaderPDFFormat(t *testing.T) {
-	// pdftotext format: blank-line blocks, standalone page number present
-	page := "3\n\nMYTH AND REALITY\n\nActual body text starts here.\nContinued body."
-	got := stripRunningHeader(page)
-	if strings.Contains(got, "MYTH AND REALITY") {
+func TestStripDetectedHeaders(t *testing.T) {
+	headers := map[string]bool{"Strange Beginnings": true}
+	footers := map[string]bool{}
+	page := "Strange Beginnings\n\n42\n\nBody content follows here.\n\nMore content."
+	got := stripDetectedHeaders(page, headers, footers)
+	if strings.Contains(got, "Strange Beginnings") {
 		t.Errorf("expected header stripped, got:\n%s", got)
 	}
-	if !strings.Contains(got, "Actual body text") {
-		t.Errorf("expected body preserved, got:\n%s", got)
-	}
-}
-
-func TestStripRunningHeaderOCRFormat(t *testing.T) {
-	// OCR format: single-newline lines, header embeds page number
-	page := "2 MYTH AND REALITY\nActual body text starts here.\nMore body."
-	got := stripRunningHeader(page)
-	if strings.Contains(got, "MYTH AND REALITY") {
-		t.Errorf("expected OCR header stripped, got:\n%s", got)
-	}
-	if !strings.Contains(got, "Actual body text") {
-		t.Errorf("expected body preserved, got:\n%s", got)
-	}
-}
-
-func TestStripRunningHeaderNoHeader(t *testing.T) {
-	page := "Normal body text.\nSecond line.\nThird line."
-	got := stripRunningHeader(page)
-	if got != page {
-		t.Errorf("expected unchanged text, got:\n%s", got)
-	}
-}
-
-func TestStripRunningHeaderBarePageNumber(t *testing.T) {
-	// Bare page number at top of OCR page
-	page := "42\nBody content follows here.\nMore content."
-	got := stripRunningHeader(page)
 	if strings.Contains(got, "42") {
-		t.Errorf("expected bare page number stripped, got:\n%s", got)
+		t.Errorf("expected page number stripped, got:\n%s", got)
 	}
 	if !strings.Contains(got, "Body content") {
 		t.Errorf("expected body preserved, got:\n%s", got)
+	}
+}
+
+func TestStripDetectedHeadersNoMatch(t *testing.T) {
+	headers := map[string]bool{"Some Other Header": true}
+	footers := map[string]bool{}
+	page := "Normal body text.\n\nSecond paragraph.\n\nThird paragraph."
+	got := stripDetectedHeaders(page, headers, footers)
+	if got != page {
+		t.Errorf("expected unchanged text, got:\n%s", got)
 	}
 }
 
@@ -338,22 +319,24 @@ func TestProcessFootnotesStripHeadersSkipsFirstPage(t *testing.T) {
 	opts := ProcessOptions{
 		SmartOCR: false, ForceOCR: false,
 		StripHeaders: true, StripFootnotes: false, TextOnly: false,
+		StripCaptions: false,
 	}
 
-	// First page header should NOT be stripped (i==0).
-	// Second page header (OCR format) SHOULD be stripped.
-	page1 := "HEADER ON FIRST PAGE\nFirst page body text."
-	page2 := "42\nSecond page body text."
-	text := page1 + "\f" + page2
+	// Build enough pages with repeated header for detection to trigger.
+	// First page content should NOT be stripped (i==0).
+	var pages []string
+	pages = append(pages, "First page body text without header.")
+	for i := 0; i < 5; i++ {
+		pages = append(pages, fmt.Sprintf("Running Title\n\n%d\n\nBody text page %d.", i+2, i+2))
+	}
+	text := strings.Join(pages, "\f")
 
 	got := p.processFootnotes(text, opts)
-	// First page header is preserved
-	if !strings.Contains(got, "HEADER ON FIRST PAGE") {
-		t.Errorf("expected first-page header preserved, got:\n%s", got)
+	if !strings.Contains(got, "First page body text") {
+		t.Errorf("expected first-page content preserved, got:\n%s", got)
 	}
-	// Second page header (bare page number) is stripped
-	if strings.Contains(got, "42") {
-		t.Errorf("expected second-page header stripped, got:\n%s", got)
+	if strings.Contains(got, "Running Title") {
+		t.Errorf("expected repeated header stripped from subsequent pages, got:\n%s", got)
 	}
 }
 
