@@ -434,7 +434,11 @@ func writeTempFile(pattern string, content []byte, logf func(string, ...any)) (s
 func runTesseractOCR(ctx context.Context, imgPath string, langs []string, logf func(string, ...any)) (text, usedLang string) {
 	ocrBase := imgPath + "_tess"
 	for _, lang := range langs {
-		if exec.CommandContext(ctx, "tesseract", imgPath, ocrBase, "-l", lang).Run() != nil {
+		cmd := exec.CommandContext(ctx, "tesseract", imgPath, ocrBase, "-l", lang)
+		// Pin Tesseract/OpenMP to one thread per worker; concurrency is already
+		// bounded by the OCR semaphore, so per-process threads would oversubscribe.
+		cmd.Env = append(os.Environ(), "OMP_NUM_THREADS=1")
+		if cmd.Run() != nil {
 			continue
 		}
 		data, err := os.ReadFile(ocrBase + ".txt")

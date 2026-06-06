@@ -8,7 +8,10 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
+
+	"golang.org/x/time/rate"
 
 	"epublic8/internal/errors"
 	"epublic8/internal/model"
@@ -33,6 +36,19 @@ func (h *WebHandler) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Per-IP rate limit, shared with handleUpload.
+	ip := clientIP(r)
+	limiterVal, ok := h.uploadLimiters.Load(ip)
+	if !ok {
+		limiterVal, _ = h.uploadLimiters.LoadOrStore(ip, rate.NewLimiter(rate.Every(6*time.Second), uploadBurst))
+	}
+	if !limiterVal.(*rate.Limiter).Allow() {
+		http.Error(w, "Too many requests", http.StatusTooManyRequests)
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<30) // 1 GB limit
+
 	file, header, err := r.FormFile("file")
 	if err != nil {
 		http.Error(w, "Missing file", http.StatusBadRequest)
@@ -42,8 +58,8 @@ func (h *WebHandler) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 
 	ct := header.Header.Get("Content-Type")
 	if ct != "application/pdf" && ct != "" {
-		// Also accept by extension.
-		if len(header.Filename) < 4 || header.Filename[len(header.Filename)-4:] != ".pdf" {
+		// Also accept by extension (case-insensitive).
+		if !strings.HasSuffix(strings.ToLower(header.Filename), ".pdf") {
 			http.Error(w, "Only PDF files can be analyzed", http.StatusBadRequest)
 			return
 		}
@@ -81,7 +97,7 @@ func (h *WebHandler) handleAnalyze(w http.ResponseWriter, r *http.Request) {
 
 	result, err := h.documentHandler.Processor.AnalyzePDF(ctx, tmpPath, pageFrom, pageTo, logf)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Analysis failed: %v", err), http.StatusInternalServerError)
+		http.Error(w, sanitizeErrorMessage(fmt.Sprintf("Analysis failed: %v", err)), http.StatusInternalServerError)
 		return
 	}
 

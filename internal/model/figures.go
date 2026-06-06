@@ -235,7 +235,7 @@ func cropFigures(imgPath string, obs []visionObs, pageNum int) []PDFImage {
 				maxTop = o.top()
 			}
 		}
-		if !allRight || minX < 0.2 {
+		if !allRight {
 			continue
 		}
 

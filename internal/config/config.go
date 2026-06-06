@@ -261,7 +261,13 @@ func applyEnvOverrides(cfg *Config) error {
 		cfg.Security.BasicAuth = v
 	}
 	if v := os.Getenv("ALLOWED_HOSTS"); v != "" {
-		cfg.Security.AllowedHosts = strings.Split(v, ",")
+		var hosts []string
+		for _, h := range strings.Split(v, ",") {
+			if h = strings.TrimSpace(h); h != "" {
+				hosts = append(hosts, h)
+			}
+		}
+		cfg.Security.AllowedHosts = hosts
 	}
 
 	// Tracing config

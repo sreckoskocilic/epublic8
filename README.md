@@ -49,7 +49,7 @@ Environment variables or `-config config.yaml`. Env vars take precedence.
 
 ### How it works
 
-1. Upload via web UI (max 250 MB). Optional page range to process a subset of pages.
+1. Upload via web UI (max 1 GB). Optional page range to process a subset of pages.
 2. Text extraction via `pdftotext`. Falls back to OCR if garbled CE-encoded fonts detected.
 3. On macOS: Vision OCR with figure detection. On Linux: Tesseract (no figures).
 4. Chapter splitting on headings (`Glava`, `Poglavlje`, `Chapter`, Roman numerals) or word count.

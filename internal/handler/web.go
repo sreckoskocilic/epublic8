@@ -322,22 +322,7 @@ func (h *WebHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 	// (e.g. K8s Ingress / cloud LB) that strips or overwrites these headers
 	// before forwarding. Exposing the service directly to untrusted traffic
 	// would allow clients to spoof X-Forwarded-For and bypass rate limiting.
-	var ip string
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// X-Forwarded-For may be "client, proxy1, proxy2" — use the first entry.
-		if idx := strings.IndexByte(xff, ','); idx != -1 {
-			ip = strings.TrimSpace(xff[:idx])
-		} else {
-			ip = strings.TrimSpace(xff)
-		}
-	} else if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		ip = strings.TrimSpace(xri)
-	} else {
-		ip, _, _ = net.SplitHostPort(r.RemoteAddr)
-		if ip == "" {
-			ip = r.RemoteAddr
-		}
-	}
+	ip := clientIP(r)
 	limiterVal, ok := h.uploadLimiters.Load(ip)
 	if !ok {
 		limiterVal, _ = h.uploadLimiters.LoadOrStore(ip, rate.NewLimiter(rate.Every(6*time.Second), uploadBurst))
@@ -623,6 +608,29 @@ func sanitizeErrorMessage(msg string) string {
 	return tempPathRe.ReplaceAllString(msg, "<redacted>")
 }
 
+// clientIP extracts the real client IP, preferring proxy headers.
+// IMPORTANT: this assumes the service is deployed behind a trusted proxy
+// (e.g. K8s Ingress / cloud LB) that strips or overwrites these headers
+// before forwarding. Exposing the service directly to untrusted traffic
+// would allow clients to spoof X-Forwarded-For and bypass rate limiting.
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		// X-Forwarded-For may be "client, proxy1, proxy2" — use the first entry.
+		if idx := strings.IndexByte(xff, ','); idx != -1 {
+			return strings.TrimSpace(xff[:idx])
+		}
+		return strings.TrimSpace(xff)
+	}
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return strings.TrimSpace(xri)
+	}
+	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if ip == "" {
+		return r.RemoteAddr
+	}
+	return ip
+}
+
 // sanitizeFilename strips directory components from name and replaces any
 // character that is not alphanumeric, a hyphen, or a dot with an underscore.
 // This prevents path traversal when the result is used in filepath.Join.
@@ -694,8 +702,8 @@ func (h *WebHandler) validateDownloadPath(filename string) (string, error) {
 	// Strip directory components; only the base name is used.
 	safeName := filepath.Base(filename)
 
-	// Only .epub files are served.
-	if filepath.Ext(safeName) != ".epub" {
+	// Only .epub files are served (case-insensitive).
+	if !strings.EqualFold(filepath.Ext(safeName), ".epub") {
 		return "", fmt.Errorf("invalid file")
 	}
 
